@@ -1,36 +1,123 @@
 """
-Uptime Service — Dashboard Server v3
-Flask + memoria — Auth multi-utente + 2FA TOTP
+Uptime Service — Dashboard Server v4
+Flask + SQLite — Auth multi-utente + 2FA TOTP + persistenza completa
 """
-from flask import Flask, request, jsonify, abort, Response, session, redirect, url_for
+from flask import Flask, request, jsonify, abort, Response, redirect
 from flask_cors import CORS
-import os, hashlib, threading, secrets, base64, time, hmac, struct
+import os, hashlib, threading, secrets, base64, time, hmac, struct, sqlite3
 from datetime import datetime, timedelta
 from functools import wraps
 import urllib.parse
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
+app.secret_key = os.environ.get("SECRET_KEY", "uptime-rmm-secret-key-2025")
 CORS(app)
 API_KEY = os.environ.get("UPTIME_API_KEY", "uptime-sos-2025")
 
-# ── Store in memoria ──────────────────────────────────────────
-_lock     = threading.Lock()
-machines  = {}
-tickets   = []
-_tid      = [1]
-orgs      = {}
-sites     = {}
-depts     = {}
-_oid      = [1]
-_sid      = [1]
-_did      = [1]
+DB_PATH = os.environ.get("DB_PATH", "dashboard.db")
+_lock = threading.Lock()
 
-# ── Auth store ────────────────────────────────────────────────
-users     = {}   # uid -> {id,username,password_hash,role,totp_secret,totp_enabled,created_at}
-sessions  = {}   # token -> {uid, created_at, totp_verified}
-_uid      = [1]
+# ── Database ──────────────────────────────────────────────────
+def get_db():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
 
+def init_db():
+    with get_db() as db:
+        db.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'viewer',
+            totp_secret TEXT NOT NULL,
+            totp_enabled INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS sessions (
+            token TEXT PRIMARY KEY,
+            uid TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            totp_verified INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS orgs (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            color TEXT NOT NULL DEFAULT '#00d4aa',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS sites (
+            id TEXT PRIMARY KEY,
+            oid TEXT NOT NULL,
+            name TEXT NOT NULL,
+            address TEXT DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS depts (
+            id TEXT PRIMARY KEY,
+            sid TEXT NOT NULL,
+            oid TEXT NOT NULL,
+            name TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS machines (
+            id TEXT PRIMARY KEY,
+            pc_name TEXT NOT NULL,
+            username TEXT DEFAULT '',
+            domain TEXT DEFAULT '',
+            ip TEXT DEFAULT '',
+            os TEXT DEFAULT '',
+            rustdesk_id TEXT DEFAULT '',
+            last_seen TEXT NOT NULL,
+            status TEXT DEFAULT 'offline',
+            cpu INTEGER DEFAULT 0,
+            ram INTEGER DEFAULT 0,
+            disk INTEGER DEFAULT 0,
+            oid TEXT,
+            sid TEXT,
+            did TEXT
+        );
+        CREATE TABLE IF NOT EXISTS tickets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            machine_id TEXT NOT NULL,
+            pc_name TEXT NOT NULL,
+            username TEXT DEFAULT '',
+            ip TEXT DEFAULT '',
+            rustdesk_id TEXT DEFAULT '',
+            description TEXT DEFAULT '',
+            screenshot TEXT DEFAULT '',
+            status TEXT DEFAULT 'open',
+            priority TEXT DEFAULT 'normal',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            note TEXT DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS counters (
+            key TEXT PRIMARY KEY,
+            val INTEGER NOT NULL DEFAULT 1
+        );
+        """)
+        # Inserisci admin di default se non esiste nessun utente
+        if not db.execute("SELECT 1 FROM users LIMIT 1").fetchone():
+            uid = _new_uid()
+            db.execute(
+                "INSERT INTO users VALUES (?,?,?,?,?,?,?)",
+                (uid, "admin", _hash("admin"), "admin", _totp_secret(), 0, _now())
+            )
+        db.commit()
+
+def _row(r):
+    return dict(r) if r else None
+
+def _rows(rs):
+    return [dict(r) for r in rs]
+
+def _new_uid():
+    return secrets.token_hex(8)
+
+# ── Helpers ───────────────────────────────────────────────────
 def _now(): return datetime.now().isoformat()
 def _hash(s): return hashlib.sha256(s.encode()).hexdigest()
 
@@ -57,49 +144,42 @@ def _totp_uri(secret, username):
     label = urllib.parse.quote(f"Uptime RMM:{username}")
     return f"otpauth://totp/{label}?secret={secret}&issuer=UptimeRMM&algorithm=SHA1&digits=6&period=30"
 
-def _qr_svg(data):
-    """Genera un QR code SVG minimale via API pubblica (URL encoded)"""
-    encoded = urllib.parse.quote(data, safe='')
-    # restituisce un URL per generare QR lato client con JS
-    return encoded
-
-# ── Crea admin di default ─────────────────────────────────────
-def _ensure_default_admin():
-    with _lock:
-        if not users:
-            uid = str(_uid[0]); _uid[0] += 1
-            totp_secret = _totp_secret()
-            users[uid] = {
-                "id": uid, "username": "admin",
-                "password_hash": _hash("admin"),
-                "role": "admin",
-                "totp_secret": totp_secret,
-                "totp_enabled": False,
-                "created_at": _now()
-            }
-
 # ── Session helpers ───────────────────────────────────────────
 def _create_session(uid):
     token = secrets.token_hex(32)
-    sessions[token] = {"uid": uid, "created_at": _now(), "totp_verified": False}
+    with get_db() as db:
+        # Pulisci sessioni vecchie dello stesso utente
+        cutoff = (datetime.now() - timedelta(hours=8)).isoformat()
+        db.execute("DELETE FROM sessions WHERE uid=? OR created_at<?", (uid, cutoff))
+        db.execute("INSERT INTO sessions VALUES (?,?,?,?)", (token, uid, _now(), 0))
+        db.commit()
     return token
 
 def _get_session(token):
-    s = sessions.get(token)
+    if not token: return None
+    with get_db() as db:
+        s = _row(db.execute("SELECT * FROM sessions WHERE token=?", (token,)).fetchone())
     if not s: return None
-    # scadenza 8 ore
     created = datetime.fromisoformat(s["created_at"])
     if datetime.now() - created > timedelta(hours=8):
-        sessions.pop(token, None)
+        with get_db() as db:
+            db.execute("DELETE FROM sessions WHERE token=?", (token,))
+            db.commit()
         return None
     return s
+
+def _set_totp_verified(token):
+    with get_db() as db:
+        db.execute("UPDATE sessions SET totp_verified=1 WHERE token=?", (token,))
+        db.commit()
 
 def _current_user():
     token = request.cookies.get("uptime_token") or request.headers.get("X-Session-Token")
     if not token: return None, None
     s = _get_session(token)
     if not s: return None, None
-    u = users.get(s["uid"])
+    with get_db() as db:
+        u = _row(db.execute("SELECT * FROM users WHERE id=?", (s["uid"],)).fetchone())
     return u, s
 
 # ── Auth decorators ───────────────────────────────────────────
@@ -116,7 +196,6 @@ def require_login(f):
 def require_api_key(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        # Accetta sia API key (per agenti) sia sessione web
         key = request.headers.get("X-API-Key") or request.args.get("api_key")
         if key == API_KEY:
             return f(*args, **kwargs)
@@ -131,7 +210,10 @@ def require_admin(f):
     def decorated(*args, **kwargs):
         u, s = _current_user()
         if not u or u.get("role") != "admin":
-            abort(403)
+            # controlla anche API key + admin
+            key = request.headers.get("X-API-Key") or request.args.get("api_key")
+            if key != API_KEY:
+                abort(403)
         return f(*args, **kwargs)
     return decorated
 
@@ -149,12 +231,14 @@ def do_login():
     d = request.json or {}
     username = d.get("username","").strip().lower()
     password = d.get("password","")
-    with _lock:
-        user = next((u for u in users.values() if u["username"].lower() == username), None)
+    with get_db() as db:
+        user = _row(db.execute(
+            "SELECT * FROM users WHERE LOWER(username)=?", (username,)
+        ).fetchone())
     if not user or user["password_hash"] != _hash(password):
         return jsonify({"ok": False, "error": "Credenziali non valide"}), 401
     token = _create_session(user["id"])
-    resp = jsonify({"ok": True, "needs_2fa": user.get("totp_enabled", False), "token": token})
+    resp = jsonify({"ok": True, "needs_2fa": bool(user["totp_enabled"]), "token": token})
     resp.set_cookie("uptime_token", token, httponly=True, samesite="Lax", max_age=28800)
     return resp
 
@@ -165,17 +249,21 @@ def verify_2fa():
     token = request.cookies.get("uptime_token") or request.headers.get("X-Session-Token")
     s = _get_session(token)
     if not s: return jsonify({"ok": False, "error": "Sessione non valida"}), 401
-    u = users.get(s["uid"])
+    with get_db() as db:
+        u = _row(db.execute("SELECT * FROM users WHERE id=?", (s["uid"],)).fetchone())
     if not u: return jsonify({"ok": False, "error": "Utente non trovato"}), 401
     if not _totp_verify(u["totp_secret"], code):
         return jsonify({"ok": False, "error": "Codice 2FA non valido"}), 401
-    s["totp_verified"] = True
+    _set_totp_verified(token)
     return jsonify({"ok": True})
 
 @app.route("/api/auth/logout", methods=["POST"])
 def logout():
     token = request.cookies.get("uptime_token")
-    if token: sessions.pop(token, None)
+    if token:
+        with get_db() as db:
+            db.execute("DELETE FROM sessions WHERE token=?", (token,))
+            db.commit()
     resp = jsonify({"ok": True})
     resp.delete_cookie("uptime_token")
     return resp
@@ -186,16 +274,17 @@ def auth_me():
     if not u: return jsonify({"ok": False}), 401
     return jsonify({"ok": True, "user": {
         "id": u["id"], "username": u["username"], "role": u["role"],
-        "totp_enabled": u.get("totp_enabled", False)
+        "totp_enabled": bool(u["totp_enabled"])
     }})
 
-# ── User management (admin only) ──────────────────────────────
+# ── User management ───────────────────────────────────────────
 @app.route("/api/users", methods=["GET"])
 @require_api_key
 @require_admin
 def get_users():
-    with _lock:
-        return jsonify([{k:v for k,v in u.items() if k not in ("password_hash","totp_secret")} for u in users.values()])
+    with get_db() as db:
+        rows = _rows(db.execute("SELECT id,username,role,totp_enabled,created_at FROM users").fetchall())
+    return jsonify(rows)
 
 @app.route("/api/users", methods=["POST"])
 @require_api_key
@@ -207,49 +296,58 @@ def create_user():
     role     = d.get("role","viewer")
     if not username or not password:
         return jsonify({"error":"Username e password obbligatori"}), 400
-    with _lock:
-        if any(u["username"].lower()==username.lower() for u in users.values()):
-            return jsonify({"error":"Username già esistente"}), 409
-        uid = str(_uid[0]); _uid[0] += 1
-        totp_secret = _totp_secret()
-        users[uid] = {"id":uid,"username":username,"password_hash":_hash(password),
-                      "role":role,"totp_secret":totp_secret,"totp_enabled":False,"created_at":_now()}
-        return jsonify({"id":uid,"username":username,"role":role,"totp_enabled":False,"created_at":users[uid]["created_at"]})
+    uid = _new_uid()
+    ts  = _totp_secret()
+    try:
+        with get_db() as db:
+            db.execute(
+                "INSERT INTO users VALUES (?,?,?,?,?,?,?)",
+                (uid, username, _hash(password), role, ts, 0, _now())
+            )
+            db.commit()
+    except sqlite3.IntegrityError:
+        return jsonify({"error":"Username già esistente"}), 409
+    return jsonify({"id":uid,"username":username,"role":role,"totp_enabled":False,"created_at":_now()})
 
 @app.route("/api/users/<uid>", methods=["PATCH"])
 @require_api_key
 @require_admin
 def update_user(uid):
     d = request.json or {}
-    with _lock:
-        if uid not in users: abort(404)
-        if "role"     in d: users[uid]["role"]          = d["role"]
-        if "password" in d: users[uid]["password_hash"] = _hash(d["password"])
-        return jsonify({"ok": True})
+    with get_db() as db:
+        if not db.execute("SELECT 1 FROM users WHERE id=?", (uid,)).fetchone(): abort(404)
+        if "role"     in d: db.execute("UPDATE users SET role=? WHERE id=?", (d["role"], uid))
+        if "password" in d: db.execute("UPDATE users SET password_hash=? WHERE id=?", (_hash(d["password"]), uid))
+        db.commit()
+    return jsonify({"ok": True})
 
 @app.route("/api/users/<uid>", methods=["DELETE"])
 @require_api_key
 @require_admin
 def delete_user(uid):
-    with _lock:
-        if uid not in users: abort(404)
-        # non puoi cancellare te stesso o l'ultimo admin
-        admins = [u for u in users.values() if u["role"]=="admin"]
-        if users[uid]["role"]=="admin" and len(admins)<=1:
+    with get_db() as db:
+        if not db.execute("SELECT 1 FROM users WHERE id=?", (uid,)).fetchone(): abort(404)
+        admins = db.execute("SELECT COUNT(*) FROM users WHERE role='admin'").fetchone()[0]
+        role   = db.execute("SELECT role FROM users WHERE id=?", (uid,)).fetchone()[0]
+        if role == "admin" and admins <= 1:
             return jsonify({"error":"Non puoi eliminare l'unico admin"}), 400
-        users.pop(uid)
-        return jsonify({"ok": True})
+        db.execute("DELETE FROM users WHERE id=?", (uid,))
+        db.execute("DELETE FROM sessions WHERE uid=?", (uid,))
+        db.commit()
+    return jsonify({"ok": True})
 
-# ── 2FA setup per l'utente corrente ───────────────────────────
+# ── 2FA ───────────────────────────────────────────────────────
 @app.route("/api/auth/2fa/setup", methods=["GET"])
 @require_api_key
 def totp_setup():
     u, _ = _current_user()
-    # Anche con API key forniamo il setup per l'admin default
+    uid_param = request.args.get("uid")
+    if uid_param:
+        with get_db() as db:
+            u = _row(db.execute("SELECT * FROM users WHERE id=?", (uid_param,)).fetchone())
     if not u:
-        # per chiamate da API key, ritorna per l'admin
-        with _lock:
-            u = next((x for x in users.values() if x["role"]=="admin"), None)
+        with get_db() as db:
+            u = _row(db.execute("SELECT * FROM users WHERE role='admin' LIMIT 1").fetchone())
     if not u: abort(401)
     uri = _totp_uri(u["totp_secret"], u["username"])
     return jsonify({"secret": u["totp_secret"], "uri": uri, "username": u["username"]})
@@ -260,17 +358,17 @@ def totp_enable():
     d = request.json or {}
     uid = d.get("uid")
     code = d.get("code","").replace(" ","")
-    u_caller, _ = _current_user()
-    with _lock:
-        target = users.get(uid) if uid else u_caller
+    with get_db() as db:
+        target = _row(db.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()) if uid else None
+        if not target:
+            u, _ = _current_user()
+            target = u
         if not target: abort(404)
-        # solo admin può abilitare per altri
-        if uid and u_caller and uid != u_caller["id"] and u_caller["role"] != "admin":
-            abort(403)
         if not _totp_verify(target["totp_secret"], code):
             return jsonify({"ok": False, "error": "Codice non valido"}), 400
-        target["totp_enabled"] = True
-        return jsonify({"ok": True})
+        db.execute("UPDATE users SET totp_enabled=1 WHERE id=?", (target["id"],))
+        db.commit()
+    return jsonify({"ok": True})
 
 @app.route("/api/auth/2fa/disable", methods=["POST"])
 @require_api_key
@@ -278,139 +376,183 @@ def totp_enable():
 def totp_disable():
     d = request.json or {}
     uid = d.get("uid")
-    with _lock:
-        if uid not in users: abort(404)
-        users[uid]["totp_enabled"] = False
-        users[uid]["totp_secret"]  = _totp_secret()  # rigenera segreto
-        return jsonify({"ok": True})
+    with get_db() as db:
+        if not db.execute("SELECT 1 FROM users WHERE id=?", (uid,)).fetchone(): abort(404)
+        new_secret = _totp_secret()
+        db.execute("UPDATE users SET totp_enabled=0, totp_secret=? WHERE id=?", (new_secret, uid))
+        db.commit()
+    return jsonify({"ok": True})
 
 # ── Org API ───────────────────────────────────────────────────
 @app.route("/api/orgs", methods=["GET"])
 @require_api_key
 def get_orgs():
-    with _lock:
-        return jsonify(list(orgs.values()))
+    with get_db() as db:
+        return jsonify(_rows(db.execute("SELECT * FROM orgs ORDER BY name").fetchall()))
 
 @app.route("/api/orgs", methods=["POST"])
 @require_api_key
 def create_org():
     d = request.json or {}
-    with _lock:
-        oid = str(_oid[0]); _oid[0] += 1
-        orgs[oid] = {"id":oid,"name":d.get("name","Nuova Org"),"color":d.get("color","#00d4aa"),"created_at":_now()}
-        return jsonify(orgs[oid])
+    oid = _new_uid()
+    row = {"id":oid,"name":d.get("name","Nuova Org"),"color":d.get("color","#00d4aa"),"created_at":_now()}
+    with get_db() as db:
+        db.execute("INSERT INTO orgs VALUES (?,?,?,?)", (row["id"],row["name"],row["color"],row["created_at"]))
+        db.commit()
+    return jsonify(row)
 
 @app.route("/api/orgs/<oid>", methods=["PATCH"])
 @require_api_key
 def update_org(oid):
     d = request.json or {}
-    with _lock:
-        if oid not in orgs: abort(404)
-        if "name"  in d: orgs[oid]["name"]  = d["name"]
-        if "color" in d: orgs[oid]["color"] = d["color"]
-        return jsonify(orgs[oid])
+    with get_db() as db:
+        if not db.execute("SELECT 1 FROM orgs WHERE id=?", (oid,)).fetchone(): abort(404)
+        if "name"  in d: db.execute("UPDATE orgs SET name=?  WHERE id=?", (d["name"],  oid))
+        if "color" in d: db.execute("UPDATE orgs SET color=? WHERE id=?", (d["color"], oid))
+        db.commit()
+        return jsonify(_row(db.execute("SELECT * FROM orgs WHERE id=?", (oid,)).fetchone()))
 
 @app.route("/api/orgs/<oid>", methods=["DELETE"])
 @require_api_key
 def delete_org(oid):
-    with _lock:
-        orgs.pop(oid, None)
-        to_del_s = [s for s,v in sites.items() if v["oid"]==oid]
-        for s in to_del_s:
-            [depts.pop(dd) for dd in [k for k,v in depts.items() if v["sid"]==s]]
-            sites.pop(s)
-        for m in machines.values():
-            if m.get("oid")==oid: m.update({"oid":None,"sid":None,"did":None})
-        return jsonify({"ok":True})
+    with get_db() as db:
+        sids = [r[0] for r in db.execute("SELECT id FROM sites WHERE oid=?", (oid,)).fetchall()]
+        for sid in sids:
+            db.execute("DELETE FROM depts WHERE sid=?", (sid,))
+        db.execute("DELETE FROM sites WHERE oid=?", (oid,))
+        db.execute("UPDATE machines SET oid=NULL,sid=NULL,did=NULL WHERE oid=?", (oid,))
+        db.execute("DELETE FROM orgs WHERE id=?", (oid,))
+        db.commit()
+    return jsonify({"ok":True})
 
 # ── Sites API ─────────────────────────────────────────────────
 @app.route("/api/sites", methods=["GET"])
 @require_api_key
 def get_sites():
     oid = request.args.get("oid")
-    with _lock:
-        result = [v for v in sites.values() if not oid or v["oid"]==oid]
-        return jsonify(result)
+    with get_db() as db:
+        if oid:
+            rows = _rows(db.execute("SELECT * FROM sites WHERE oid=? ORDER BY name", (oid,)).fetchall())
+        else:
+            rows = _rows(db.execute("SELECT * FROM sites ORDER BY name").fetchall())
+    return jsonify(rows)
 
 @app.route("/api/sites", methods=["POST"])
 @require_api_key
 def create_site():
     d = request.json or {}
-    with _lock:
-        sid = str(_sid[0]); _sid[0] += 1
-        sites[sid] = {"id":sid,"oid":d.get("oid",""),"name":d.get("name","Nuova Sede"),"address":d.get("address",""),"created_at":_now()}
-        return jsonify(sites[sid])
+    sid = _new_uid()
+    row = {"id":sid,"oid":d.get("oid",""),"name":d.get("name","Nuova Sede"),"address":d.get("address",""),"created_at":_now()}
+    with get_db() as db:
+        db.execute("INSERT INTO sites VALUES (?,?,?,?,?)", (row["id"],row["oid"],row["name"],row["address"],row["created_at"]))
+        db.commit()
+    return jsonify(row)
 
 @app.route("/api/sites/<sid>", methods=["PATCH"])
 @require_api_key
 def update_site(sid):
     d = request.json or {}
-    with _lock:
-        if sid not in sites: abort(404)
-        for k in ["name","address","oid"]:
-            if k in d: sites[sid][k] = d[k]
-        return jsonify(sites[sid])
+    with get_db() as db:
+        if not db.execute("SELECT 1 FROM sites WHERE id=?", (sid,)).fetchone(): abort(404)
+        for k,col in [("name","name"),("address","address"),("oid","oid")]:
+            if k in d: db.execute(f"UPDATE sites SET {col}=? WHERE id=?", (d[k], sid))
+        db.commit()
+        return jsonify(_row(db.execute("SELECT * FROM sites WHERE id=?", (sid,)).fetchone()))
 
 @app.route("/api/sites/<sid>", methods=["DELETE"])
 @require_api_key
 def delete_site(sid):
-    with _lock:
-        sites.pop(sid, None)
-        [depts.pop(dd) for dd in [k for k,v in depts.items() if v["sid"]==sid]]
-        for m in machines.values():
-            if m.get("sid")==sid: m.update({"sid":None,"did":None})
-        return jsonify({"ok":True})
+    with get_db() as db:
+        db.execute("DELETE FROM depts WHERE sid=?", (sid,))
+        db.execute("UPDATE machines SET sid=NULL,did=NULL WHERE sid=?", (sid,))
+        db.execute("DELETE FROM sites WHERE id=?", (sid,))
+        db.commit()
+    return jsonify({"ok":True})
 
 # ── Depts API ─────────────────────────────────────────────────
 @app.route("/api/depts", methods=["GET"])
 @require_api_key
 def get_depts():
     sid = request.args.get("sid")
-    with _lock:
-        result = [v for v in depts.values() if not sid or v["sid"]==sid]
-        return jsonify(result)
+    with get_db() as db:
+        if sid:
+            rows = _rows(db.execute("SELECT * FROM depts WHERE sid=? ORDER BY name", (sid,)).fetchall())
+        else:
+            rows = _rows(db.execute("SELECT * FROM depts ORDER BY name").fetchall())
+    return jsonify(rows)
 
 @app.route("/api/depts", methods=["POST"])
 @require_api_key
 def create_dept():
     d = request.json or {}
-    with _lock:
-        did = str(_did[0]); _did[0] += 1
-        depts[did] = {"id":did,"sid":d.get("sid",""),"oid":d.get("oid",""),"name":d.get("name","Nuovo Reparto"),"created_at":_now()}
-        return jsonify(depts[did])
+    did = _new_uid()
+    row = {"id":did,"sid":d.get("sid",""),"oid":d.get("oid",""),"name":d.get("name","Nuovo Reparto"),"created_at":_now()}
+    with get_db() as db:
+        db.execute("INSERT INTO depts VALUES (?,?,?,?,?)", (row["id"],row["sid"],row["oid"],row["name"],row["created_at"]))
+        db.commit()
+    return jsonify(row)
 
 @app.route("/api/depts/<did>", methods=["PATCH"])
 @require_api_key
 def update_dept(did):
     d = request.json or {}
-    with _lock:
-        if did not in depts: abort(404)
+    with get_db() as db:
+        if not db.execute("SELECT 1 FROM depts WHERE id=?", (did,)).fetchone(): abort(404)
         for k in ["name","sid","oid"]:
-            if k in d: depts[did][k] = d[k]
-        return jsonify(depts[did])
+            if k in d: db.execute(f"UPDATE depts SET {k}=? WHERE id=?", (d[k], did))
+        db.commit()
+        return jsonify(_row(db.execute("SELECT * FROM depts WHERE id=?", (did,)).fetchone()))
 
 @app.route("/api/depts/<did>", methods=["DELETE"])
 @require_api_key
 def delete_dept(did):
-    with _lock:
-        depts.pop(did, None)
-        for m in machines.values():
-            if m.get("did")==did: m["did"] = None
-        return jsonify({"ok":True})
+    with get_db() as db:
+        db.execute("UPDATE machines SET did=NULL WHERE did=?", (did,))
+        db.execute("DELETE FROM depts WHERE id=?", (did,))
+        db.commit()
+    return jsonify({"ok":True})
 
 # ── Machine assign ────────────────────────────────────────────
 @app.route("/api/machines/<mid>/assign", methods=["PATCH"])
 @require_api_key
 def assign_machine(mid):
     d = request.json or {}
-    with _lock:
-        if mid not in machines: abort(404)
-        machines[mid]["oid"] = d.get("oid")
-        machines[mid]["sid"] = d.get("sid")
-        machines[mid]["did"] = d.get("did")
-        return jsonify({"ok":True})
+    with get_db() as db:
+        if not db.execute("SELECT 1 FROM machines WHERE id=?", (mid,)).fetchone(): abort(404)
+        db.execute("UPDATE machines SET oid=?,sid=?,did=? WHERE id=?",
+                   (d.get("oid"), d.get("sid"), d.get("did"), mid))
+        db.commit()
+    return jsonify({"ok":True})
 
-# ── Ticket API ────────────────────────────────────────────────
+# ── Ticket / Heartbeat / Machines API ─────────────────────────
+def _upsert_machine(db, mid, pc, domain, data, now):
+    existing = db.execute("SELECT * FROM machines WHERE id=?", (mid,)).fetchone()
+    if existing:
+        db.execute("""UPDATE machines SET
+            username=COALESCE(NULLIF(?,''),(SELECT username FROM machines WHERE id=?)),
+            ip=COALESCE(NULLIF(?,''),(SELECT ip FROM machines WHERE id=?)),
+            rustdesk_id=COALESCE(NULLIF(?,''),(SELECT rustdesk_id FROM machines WHERE id=?)),
+            last_seen=?, status='online',
+            cpu=?, ram=?, disk=?
+            WHERE id=?""", (
+            data.get("user",""), mid,
+            data.get("ip",""),   mid,
+            data.get("rustdesk_id",""), mid,
+            now,
+            data.get("cpu",0), data.get("ram",0), data.get("disk",0),
+            mid))
+    else:
+        db.execute("""INSERT INTO machines
+            (id,pc_name,username,domain,ip,os,rustdesk_id,last_seen,status,cpu,ram,disk,oid,sid,did)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+            mid, pc,
+            data.get("user",""), domain,
+            data.get("ip",""), data.get("os",""),
+            data.get("rustdesk_id",""),
+            now, "online",
+            data.get("cpu",0), data.get("ram",0), data.get("disk",0),
+            None, None, None))
+
 @app.route("/api/ticket", methods=["POST"])
 @require_api_key
 def create_ticket():
@@ -419,14 +561,19 @@ def create_ticket():
     mid = hashlib.md5(f"{pc}{domain}".encode()).hexdigest()[:12]
     now = _now()
     with _lock:
-        if mid in machines:
-            machines[mid].update({"user":data.get("user",machines[mid]["user"]),"ip":data.get("ip",machines[mid]["ip"]),"rustdesk_id":data.get("rustdesk_id",machines[mid]["rustdesk_id"]),"last_seen":now,"status":"online"})
-        else:
-            machines[mid] = {"id":mid,"pc_name":pc,"user":data.get("user",""),"domain":domain,"ip":data.get("ip",""),"os":data.get("os",""),"rustdesk_id":data.get("rustdesk_id",""),"last_seen":now,"status":"online","cpu":0,"ram":0,"disk":0,"oid":None,"sid":None,"did":None}
-        tid = _tid[0]; _tid[0] += 1
-        t = {"id":tid,"machine_id":mid,"pc_name":pc,"user":data.get("user",""),"ip":data.get("ip",""),"rustdesk_id":data.get("rustdesk_id",""),"description":data.get("description",""),"screenshot":data.get("screenshot",""),"status":"open","priority":data.get("priority","normal"),"created_at":now,"updated_at":now,"note":""}
-        tickets.append(t)
-        return jsonify({"ok":True,"ticket_id":tid,"machine_id":mid})
+        with get_db() as db:
+            _upsert_machine(db, mid, pc, domain, data, now)
+            db.execute("""INSERT INTO tickets
+                (machine_id,pc_name,username,ip,rustdesk_id,description,screenshot,status,priority,created_at,updated_at,note)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                mid, pc,
+                data.get("user",""), data.get("ip",""),
+                data.get("rustdesk_id",""), data.get("description",""),
+                data.get("screenshot",""), "open",
+                data.get("priority","normal"), now, now, ""))
+            tid = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+            db.commit()
+    return jsonify({"ok":True,"ticket_id":tid,"machine_id":mid})
 
 @app.route("/api/heartbeat", methods=["POST"])
 @require_api_key
@@ -436,94 +583,116 @@ def heartbeat():
     mid = hashlib.md5(f"{pc}{domain}".encode()).hexdigest()[:12]
     now = _now()
     with _lock:
-        if mid in machines:
-            machines[mid].update({"last_seen":now,"status":"online","cpu":data.get("cpu",0),"ram":data.get("ram",0),"disk":data.get("disk",0),"rustdesk_id":data.get("rustdesk_id",machines[mid]["rustdesk_id"])})
-        else:
-            machines[mid] = {"id":mid,"pc_name":pc,"user":data.get("user",""),"domain":domain,"ip":data.get("ip",""),"os":data.get("os",""),"rustdesk_id":data.get("rustdesk_id",""),"last_seen":now,"status":"online","cpu":data.get("cpu",0),"ram":data.get("ram",0),"disk":data.get("disk",0),"oid":None,"sid":None,"did":None}
+        with get_db() as db:
+            _upsert_machine(db, mid, pc, domain, data, now)
+            db.commit()
     return jsonify({"ok":True})
 
 @app.route("/api/machines")
 @require_api_key
 def get_machines():
     threshold = (datetime.now()-timedelta(minutes=5)).isoformat()
-    with _lock:
-        for m in machines.values():
-            if m["last_seen"] < threshold: m["status"]="offline"
-        return jsonify(list(machines.values()))
+    with get_db() as db:
+        db.execute("UPDATE machines SET status='offline' WHERE last_seen<?", (threshold,))
+        db.commit()
+        rows = _rows(db.execute("SELECT * FROM machines ORDER BY pc_name").fetchall())
+    # rinomina username -> user per compatibilità frontend
+    for r in rows:
+        r["user"] = r.pop("username", "")
+    return jsonify(rows)
 
 @app.route("/api/tickets")
 @require_api_key
 def get_tickets():
     status = request.args.get("status","all")
-    with _lock:
-        result = []
-        for t in reversed(tickets):
-            if status!="all" and t["status"]!=status: continue
-            d = dict(t); d.pop("screenshot",None); result.append(d)
-        return jsonify(result)
+    with get_db() as db:
+        if status == "all":
+            rows = _rows(db.execute("SELECT * FROM tickets ORDER BY id DESC").fetchall())
+        else:
+            rows = _rows(db.execute("SELECT * FROM tickets WHERE status=? ORDER BY id DESC", (status,)).fetchall())
+    for r in rows:
+        r.pop("screenshot", None)
+        r["user"] = r.pop("username", "")
+    return jsonify(rows)
 
 @app.route("/api/ticket/<int:tid>")
 @require_api_key
 def get_ticket(tid):
-    with _lock:
-        for t in tickets:
-            if t["id"]==tid: return jsonify(dict(t))
-    abort(404)
+    with get_db() as db:
+        row = _row(db.execute("SELECT * FROM tickets WHERE id=?", (tid,)).fetchone())
+    if not row: abort(404)
+    row["user"] = row.pop("username", "")
+    return jsonify(row)
 
 @app.route("/api/ticket/<int:tid>", methods=["PATCH"])
 @require_api_key
 def update_ticket(tid):
     data = request.json or {}
-    with _lock:
-        for t in tickets:
-            if t["id"]==tid:
-                for k in ["status","priority","note"]:
-                    if k in data: t[k]=data[k]
-                t["updated_at"]=_now()
-                return jsonify({"ok":True})
-    abort(404)
+    with get_db() as db:
+        if not db.execute("SELECT 1 FROM tickets WHERE id=?", (tid,)).fetchone(): abort(404)
+        for k in ["status","priority","note"]:
+            if k in data: db.execute(f"UPDATE tickets SET {k}=? WHERE id=?", (data[k], tid))
+        db.execute("UPDATE tickets SET updated_at=? WHERE id=?", (_now(), tid))
+        db.commit()
+    return jsonify({"ok":True})
 
 @app.route("/api/stats")
 @require_api_key
 def get_stats():
     threshold = (datetime.now()-timedelta(minutes=5)).isoformat()
-    with _lock:
-        total  = len(machines)
-        online = sum(1 for m in machines.values() if m["last_seen"]>=threshold)
-        return jsonify({"total_machines":total,"online_machines":online,"offline_machines":total-online,"open_tickets":sum(1 for t in tickets if t["status"]=="open"),"closed_tickets":sum(1 for t in tickets if t["status"]=="closed"),"urgent_tickets":sum(1 for t in tickets if t["status"]=="open" and t["priority"]=="urgent"),"total_orgs":len(orgs)})
+    with get_db() as db:
+        total   = db.execute("SELECT COUNT(*) FROM machines").fetchone()[0]
+        online  = db.execute("SELECT COUNT(*) FROM machines WHERE last_seen>=?", (threshold,)).fetchone()[0]
+        t_open  = db.execute("SELECT COUNT(*) FROM tickets WHERE status='open'").fetchone()[0]
+        t_close = db.execute("SELECT COUNT(*) FROM tickets WHERE status='closed'").fetchone()[0]
+        urgent  = db.execute("SELECT COUNT(*) FROM tickets WHERE status='open' AND priority='urgent'").fetchone()[0]
+        norgs   = db.execute("SELECT COUNT(*) FROM orgs").fetchone()[0]
+    return jsonify({"total_machines":total,"online_machines":online,"offline_machines":total-online,
+                    "open_tickets":t_open,"closed_tickets":t_close,"urgent_tickets":urgent,"total_orgs":norgs})
 
 @app.route("/api/demo", methods=["POST"])
 def demo_data():
+    now = _now()
     with _lock:
-        orgs["1"]={"id":"1","name":"Emotion Design Srl","color":"#00d4aa","created_at":_now()}
-        orgs["2"]={"id":"2","name":"Cliente Rossi Spa","color":"#0091ff","created_at":_now()}
-        _oid[0]=3
-        sites["1"]={"id":"1","oid":"1","name":"Sede Milano","address":"Via Roma 1, Milano","created_at":_now()}
-        sites["2"]={"id":"2","oid":"1","name":"Sede Roma","address":"Via Veneto 10, Roma","created_at":_now()}
-        sites["3"]={"id":"3","oid":"2","name":"Sede Principale","address":"Corso Italia 5, Torino","created_at":_now()}
-        _sid[0]=4
-        depts["1"]={"id":"1","sid":"1","oid":"1","name":"Amministrazione","created_at":_now()}
-        depts["2"]={"id":"2","sid":"1","oid":"1","name":"IT","created_at":_now()}
-        depts["3"]={"id":"3","sid":"2","oid":"1","name":"Commerciale","created_at":_now()}
-        _did[0]=4
-        ms=[
-            {"id":"abc001","pc_name":"DESKTOP-MARIO","user":"mario.rossi","domain":"EMOTIONDESIGN","ip":"192.168.1.10","os":"Windows 11 Pro","rustdesk_id":"123 456 789","last_seen":_now(),"status":"online","cpu":45,"ram":62,"disk":78,"oid":"1","sid":"1","did":"1"},
-            {"id":"abc002","pc_name":"LAPTOP-GIULIA","user":"giulia.bianchi","domain":"EMOTIONDESIGN","ip":"192.168.1.11","os":"Windows 10 Pro","rustdesk_id":"987 654 321","last_seen":_now(),"status":"online","cpu":12,"ram":34,"disk":45,"oid":"1","sid":"1","did":"2"},
-            {"id":"abc003","pc_name":"PC-CONTABILITA","user":"admin","domain":"WORKGROUP","ip":"192.168.1.20","os":"Windows 10 Home","rustdesk_id":"","last_seen":"2020-01-01","status":"offline","cpu":0,"ram":0,"disk":0,"oid":"1","sid":"2","did":"3"},
-            {"id":"abc004","pc_name":"SERVER-FILE","user":"Administrator","domain":"EMOTIONDESIGN","ip":"192.168.1.1","os":"Windows Server 2022","rustdesk_id":"111 222 333","last_seen":_now(),"status":"online","cpu":78,"ram":88,"disk":92,"oid":"2","sid":"3","did":None},
-        ]
-        for m in ms: machines[m["id"]]=m
-        ts=[
-            {"pc_name":"DESKTOP-MARIO","user":"mario.rossi","domain":"EMOTIONDESIGN","ip":"192.168.1.10","rustdesk_id":"123 456 789","description":"Il PC va lento, non riesco ad aprire Excel","priority":"urgent"},
-            {"pc_name":"LAPTOP-GIULIA","user":"giulia.bianchi","domain":"EMOTIONDESIGN","ip":"192.168.1.11","rustdesk_id":"987 654 321","description":"Stampante non trovata in rete","priority":"normal"},
-            {"pc_name":"SERVER-FILE","user":"Administrator","domain":"EMOTIONDESIGN","ip":"192.168.1.1","rustdesk_id":"111 222 333","description":"Disco quasi pieno 92%","priority":"urgent"},
-        ]
-        for d in ts:
-            mid=hashlib.md5(f"{d['pc_name']}{d['domain']}".encode()).hexdigest()[:12]
-            d["machine_id"]=mid; tid=_tid[0]; _tid[0]+=1
-            tickets.append({"id":tid,"machine_id":mid,"pc_name":d["pc_name"],"user":d["user"],"ip":d["ip"],"rustdesk_id":d["rustdesk_id"],"description":d["description"],"screenshot":"","status":"open","priority":d["priority"],"created_at":_now(),"updated_at":_now(),"note":""})
+        with get_db() as db:
+            # Orgs
+            db.execute("DELETE FROM orgs WHERE id IN ('d1','d2')")
+            db.execute("INSERT OR REPLACE INTO orgs VALUES ('d1','Emotion Design Srl','#00d4aa',?)", (now,))
+            db.execute("INSERT OR REPLACE INTO orgs VALUES ('d2','Cliente Rossi Spa','#0091ff',?)", (now,))
+            # Sites
+            db.execute("INSERT OR REPLACE INTO sites VALUES ('s1','d1','Sede Milano','Via Roma 1, Milano',?)", (now,))
+            db.execute("INSERT OR REPLACE INTO sites VALUES ('s2','d1','Sede Roma','Via Veneto 10, Roma',?)", (now,))
+            db.execute("INSERT OR REPLACE INTO sites VALUES ('s3','d2','Sede Principale','Corso Italia 5, Torino',?)", (now,))
+            # Depts
+            db.execute("INSERT OR REPLACE INTO depts VALUES ('dp1','s1','d1','Amministrazione',?)", (now,))
+            db.execute("INSERT OR REPLACE INTO depts VALUES ('dp2','s1','d1','IT',?)", (now,))
+            db.execute("INSERT OR REPLACE INTO depts VALUES ('dp3','s2','d1','Commerciale',?)", (now,))
+            # Machines
+            ms = [
+                ("abc001","DESKTOP-MARIO","mario.rossi","EMOTIONDESIGN","192.168.1.10","Windows 11 Pro","123 456 789",now,"online",45,62,78,"d1","s1","dp1"),
+                ("abc002","LAPTOP-GIULIA","giulia.bianchi","EMOTIONDESIGN","192.168.1.11","Windows 10 Pro","987 654 321",now,"online",12,34,45,"d1","s1","dp2"),
+                ("abc003","PC-CONTABILITA","admin","WORKGROUP","192.168.1.20","Windows 10 Home","","2020-01-01","offline",0,0,0,"d1","s2","dp3"),
+                ("abc004","SERVER-FILE","Administrator","EMOTIONDESIGN","192.168.1.1","Windows Server 2022","111 222 333",now,"online",78,88,92,"d2","s3",None),
+            ]
+            for m in ms:
+                db.execute("""INSERT OR REPLACE INTO machines
+                    (id,pc_name,username,domain,ip,os,rustdesk_id,last_seen,status,cpu,ram,disk,oid,sid,did)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", m)
+            # Tickets
+            ts = [
+                ("abc001","DESKTOP-MARIO","mario.rossi","192.168.1.10","123 456 789","Il PC va lento, non riesco ad aprire Excel","urgent"),
+                ("abc002","LAPTOP-GIULIA","giulia.bianchi","192.168.1.11","987 654 321","Stampante non trovata in rete","normal"),
+                ("abc004","SERVER-FILE","Administrator","192.168.1.1","111 222 333","Disco quasi pieno 92%","urgent"),
+            ]
+            for t in ts:
+                existing = db.execute("SELECT 1 FROM tickets WHERE machine_id=? AND description=?", (t[0],t[5])).fetchone()
+                if not existing:
+                    db.execute("""INSERT INTO tickets
+                        (machine_id,pc_name,username,ip,rustdesk_id,description,screenshot,status,priority,created_at,updated_at,note)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (t[0],t[1],t[2],t[3],t[4],t[5],"","open",t[6],now,now,""))
+            db.commit()
     return jsonify({"ok":True})
-
 
 # ═══════════════════════════════════════════════════════════════
 # HTML TEMPLATES
@@ -1527,9 +1696,9 @@ function clock(){document.getElementById('clk').textContent=new Date().toLocaleT
 def dashboard():
     return Response(DASHBOARD_HTML, mimetype="text/html")
 
-_ensure_default_admin()
+init_db()
 
 if __name__ == "__main__":
-    print("Uptime Service Dashboard v3 — http://localhost:5000")
+    print("Uptime Service Dashboard v4 — SQLite — http://localhost:5000")
     print("Login: admin / admin")
     app.run(debug=False, host="0.0.0.0", port=5000)
