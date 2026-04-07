@@ -94,12 +94,51 @@ def init_db():
             updated_at TEXT NOT NULL,
             note TEXT DEFAULT ''
         );
-        CREATE TABLE IF NOT EXISTS counters (
-            key TEXT PRIMARY KEY,
-            val INTEGER NOT NULL DEFAULT 1
+        CREATE TABLE IF NOT EXISTS doc_apps (
+            id TEXT PRIMARY KEY,
+            oid TEXT NOT NULL,
+            name TEXT NOT NULL,
+            category TEXT DEFAULT 'Software',
+            version TEXT DEFAULT '',
+            license_type TEXT DEFAULT '',
+            license_count INTEGER DEFAULT 0,
+            license_expiry TEXT DEFAULT '',
+            notes TEXT DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS doc_kb (
+            id TEXT PRIMARY KEY,
+            oid TEXT NOT NULL,
+            title TEXT NOT NULL,
+            category TEXT DEFAULT 'Generale',
+            content TEXT DEFAULT '',
+            tags TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS doc_checklists (
+            id TEXT PRIMARY KEY,
+            oid TEXT NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS doc_checklist_items (
+            id TEXT PRIMARY KEY,
+            checklist_id TEXT NOT NULL,
+            text TEXT NOT NULL,
+            checked INTEGER NOT NULL DEFAULT 0,
+            sort_order INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS doc_wiki (
+            id TEXT PRIMARY KEY,
+            oid TEXT NOT NULL,
+            title TEXT NOT NULL,
+            content TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
         );
         """)
-        # Inserisci admin di default se non esiste nessun utente
         if not db.execute("SELECT 1 FROM users LIMIT 1").fetchone():
             uid = _new_uid()
             db.execute(
@@ -107,6 +146,7 @@ def init_db():
                 (uid, "admin", _hash("admin"), "admin", _totp_secret(), 0, _now())
             )
         db.commit()
+
 
 def _row(r):
     return dict(r) if r else None
@@ -695,6 +735,211 @@ def demo_data():
     return jsonify({"ok":True})
 
 # ═══════════════════════════════════════════════════════════════
+
+# ── Documentation API ─────────────────────────────────────────
+# Tabelle: doc_apps, doc_kb, doc_checklists, doc_checklist_items, doc_wiki
+
+# ── App e Servizi ─────────────────────────────────────────────
+@app.route("/api/orgs/<oid>/docs/apps", methods=["GET"])
+@require_api_key
+def get_doc_apps(oid):
+    with get_db() as db:
+        rows = _rows(db.execute("SELECT * FROM doc_apps WHERE oid=? ORDER BY name", (oid,)).fetchall())
+    return jsonify(rows)
+
+@app.route("/api/orgs/<oid>/docs/apps", methods=["POST"])
+@require_api_key
+def create_doc_app(oid):
+    d = request.json or {}
+    aid = _new_uid()
+    row = {"id":aid,"oid":oid,"name":d.get("name",""),"category":d.get("category","Software"),
+           "version":d.get("version",""),"license_type":d.get("license_type",""),
+           "license_count":d.get("license_count",0),"license_expiry":d.get("license_expiry",""),
+           "notes":d.get("notes",""),"created_at":_now()}
+    with get_db() as db:
+        db.execute("INSERT INTO doc_apps VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (row["id"],row["oid"],row["name"],row["category"],row["version"],
+             row["license_type"],row["license_count"],row["license_expiry"],row["notes"],row["created_at"]))
+        db.commit()
+    return jsonify(row)
+
+@app.route("/api/orgs/<oid>/docs/apps/<aid>", methods=["PATCH"])
+@require_api_key
+def update_doc_app(oid, aid):
+    d = request.json or {}
+    with get_db() as db:
+        if not db.execute("SELECT 1 FROM doc_apps WHERE id=? AND oid=?", (aid,oid)).fetchone(): abort(404)
+        for k in ["name","category","version","license_type","license_count","license_expiry","notes"]:
+            if k in d: db.execute(f"UPDATE doc_apps SET {k}=? WHERE id=?", (d[k], aid))
+        db.commit()
+        return jsonify(_row(db.execute("SELECT * FROM doc_apps WHERE id=?", (aid,)).fetchone()))
+
+@app.route("/api/orgs/<oid>/docs/apps/<aid>", methods=["DELETE"])
+@require_api_key
+def delete_doc_app(oid, aid):
+    with get_db() as db:
+        db.execute("DELETE FROM doc_apps WHERE id=? AND oid=?", (aid, oid))
+        db.commit()
+    return jsonify({"ok":True})
+
+# ── Knowledge Base ────────────────────────────────────────────
+@app.route("/api/orgs/<oid>/docs/kb", methods=["GET"])
+@require_api_key
+def get_doc_kb(oid):
+    with get_db() as db:
+        rows = _rows(db.execute("SELECT * FROM doc_kb WHERE oid=? ORDER BY created_at DESC", (oid,)).fetchall())
+    return jsonify(rows)
+
+@app.route("/api/orgs/<oid>/docs/kb", methods=["POST"])
+@require_api_key
+def create_doc_kb(oid):
+    d = request.json or {}
+    kid = _new_uid()
+    now = _now()
+    row = {"id":kid,"oid":oid,"title":d.get("title","Nuovo articolo"),
+           "category":d.get("category","Generale"),"content":d.get("content",""),
+           "tags":d.get("tags",""),"created_at":now,"updated_at":now}
+    with get_db() as db:
+        db.execute("INSERT INTO doc_kb VALUES (?,?,?,?,?,?,?,?)",
+            (row["id"],row["oid"],row["title"],row["category"],row["content"],row["tags"],row["created_at"],row["updated_at"]))
+        db.commit()
+    return jsonify(row)
+
+@app.route("/api/orgs/<oid>/docs/kb/<kid>", methods=["PATCH"])
+@require_api_key
+def update_doc_kb(oid, kid):
+    d = request.json or {}
+    with get_db() as db:
+        if not db.execute("SELECT 1 FROM doc_kb WHERE id=? AND oid=?", (kid,oid)).fetchone(): abort(404)
+        for k in ["title","category","content","tags"]:
+            if k in d: db.execute(f"UPDATE doc_kb SET {k}=? WHERE id=?", (d[k], kid))
+        db.execute("UPDATE doc_kb SET updated_at=? WHERE id=?", (_now(), kid))
+        db.commit()
+        return jsonify(_row(db.execute("SELECT * FROM doc_kb WHERE id=?", (kid,)).fetchone()))
+
+@app.route("/api/orgs/<oid>/docs/kb/<kid>", methods=["DELETE"])
+@require_api_key
+def delete_doc_kb(oid, kid):
+    with get_db() as db:
+        db.execute("DELETE FROM doc_kb WHERE id=? AND oid=?", (kid, oid))
+        db.commit()
+    return jsonify({"ok":True})
+
+# ── Checklist ─────────────────────────────────────────────────
+@app.route("/api/orgs/<oid>/docs/checklists", methods=["GET"])
+@require_api_key
+def get_doc_checklists(oid):
+    with get_db() as db:
+        cls = _rows(db.execute("SELECT * FROM doc_checklists WHERE oid=? ORDER BY created_at DESC", (oid,)).fetchall())
+        for cl in cls:
+            items = _rows(db.execute("SELECT * FROM doc_checklist_items WHERE checklist_id=? ORDER BY sort_order", (cl["id"],)).fetchall())
+            cl["items"] = items
+    return jsonify(cls)
+
+@app.route("/api/orgs/<oid>/docs/checklists", methods=["POST"])
+@require_api_key
+def create_doc_checklist(oid):
+    d = request.json or {}
+    cid = _new_uid()
+    row = {"id":cid,"oid":oid,"name":d.get("name","Nuova checklist"),"description":d.get("description",""),"created_at":_now()}
+    with get_db() as db:
+        db.execute("INSERT INTO doc_checklists VALUES (?,?,?,?,?)",
+            (row["id"],row["oid"],row["name"],row["description"],row["created_at"]))
+        db.commit()
+    row["items"] = []
+    return jsonify(row)
+
+@app.route("/api/orgs/<oid>/docs/checklists/<cid>", methods=["PATCH"])
+@require_api_key
+def update_doc_checklist(oid, cid):
+    d = request.json or {}
+    with get_db() as db:
+        if not db.execute("SELECT 1 FROM doc_checklists WHERE id=? AND oid=?", (cid,oid)).fetchone(): abort(404)
+        for k in ["name","description"]:
+            if k in d: db.execute(f"UPDATE doc_checklists SET {k}=? WHERE id=?", (d[k], cid))
+        db.commit()
+    return jsonify({"ok":True})
+
+@app.route("/api/orgs/<oid>/docs/checklists/<cid>", methods=["DELETE"])
+@require_api_key
+def delete_doc_checklist(oid, cid):
+    with get_db() as db:
+        db.execute("DELETE FROM doc_checklist_items WHERE checklist_id=?", (cid,))
+        db.execute("DELETE FROM doc_checklists WHERE id=? AND oid=?", (cid, oid))
+        db.commit()
+    return jsonify({"ok":True})
+
+@app.route("/api/orgs/<oid>/docs/checklists/<cid>/items", methods=["POST"])
+@require_api_key
+def create_checklist_item(oid, cid):
+    d = request.json or {}
+    iid = _new_uid()
+    with get_db() as db:
+        cnt = db.execute("SELECT COUNT(*) FROM doc_checklist_items WHERE checklist_id=?", (cid,)).fetchone()[0]
+        db.execute("INSERT INTO doc_checklist_items VALUES (?,?,?,?,?)",
+            (iid, cid, d.get("text","Nuovo elemento"), 0, cnt))
+        db.commit()
+        return jsonify(_row(db.execute("SELECT * FROM doc_checklist_items WHERE id=?", (iid,)).fetchone()))
+
+@app.route("/api/orgs/<oid>/docs/checklists/<cid>/items/<iid>", methods=["PATCH"])
+@require_api_key
+def update_checklist_item(oid, cid, iid):
+    d = request.json or {}
+    with get_db() as db:
+        if "text"    in d: db.execute("UPDATE doc_checklist_items SET text=?    WHERE id=?", (d["text"], iid))
+        if "checked" in d: db.execute("UPDATE doc_checklist_items SET checked=? WHERE id=?", (1 if d["checked"] else 0, iid))
+        db.commit()
+    return jsonify({"ok":True})
+
+@app.route("/api/orgs/<oid>/docs/checklists/<cid>/items/<iid>", methods=["DELETE"])
+@require_api_key
+def delete_checklist_item(oid, cid, iid):
+    with get_db() as db:
+        db.execute("DELETE FROM doc_checklist_items WHERE id=?", (iid,))
+        db.commit()
+    return jsonify({"ok":True})
+
+# ── Wiki / Note libere ────────────────────────────────────────
+@app.route("/api/orgs/<oid>/docs/wiki", methods=["GET"])
+@require_api_key
+def get_doc_wiki(oid):
+    with get_db() as db:
+        rows = _rows(db.execute("SELECT * FROM doc_wiki WHERE oid=? ORDER BY updated_at DESC", (oid,)).fetchall())
+    return jsonify(rows)
+
+@app.route("/api/orgs/<oid>/docs/wiki", methods=["POST"])
+@require_api_key
+def create_doc_wiki(oid):
+    d = request.json or {}
+    wid = _new_uid()
+    now = _now()
+    row = {"id":wid,"oid":oid,"title":d.get("title","Nuova nota"),"content":d.get("content",""),"created_at":now,"updated_at":now}
+    with get_db() as db:
+        db.execute("INSERT INTO doc_wiki VALUES (?,?,?,?,?,?)",
+            (row["id"],row["oid"],row["title"],row["content"],row["created_at"],row["updated_at"]))
+        db.commit()
+    return jsonify(row)
+
+@app.route("/api/orgs/<oid>/docs/wiki/<wid>", methods=["PATCH"])
+@require_api_key
+def update_doc_wiki(oid, wid):
+    d = request.json or {}
+    with get_db() as db:
+        if not db.execute("SELECT 1 FROM doc_wiki WHERE id=? AND oid=?", (wid,oid)).fetchone(): abort(404)
+        for k in ["title","content"]:
+            if k in d: db.execute(f"UPDATE doc_wiki SET {k}=? WHERE id=?", (d[k], wid))
+        db.execute("UPDATE doc_wiki SET updated_at=? WHERE id=?", (_now(), wid))
+        db.commit()
+    return jsonify({"ok":True})
+
+@app.route("/api/orgs/<oid>/docs/wiki/<wid>", methods=["DELETE"])
+@require_api_key
+def delete_doc_wiki(oid, wid):
+    with get_db() as db:
+        db.execute("DELETE FROM doc_wiki WHERE id=? AND oid=?", (wid, oid))
+        db.commit()
+    return jsonify({"ok":True})
+
 # HTML TEMPLATES
 # ═══════════════════════════════════════════════════════════════
 
@@ -1149,6 +1394,13 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
       </div>
     </div>
 
+
+    <!-- DOCUMENTAZIONE ORG -->
+    <div id="view-org-docs" class="view">
+      <div id="doc-org-title"></div>
+      <div id="doc-content"></div>
+    </div>
+
   </div>
 </div>
 
@@ -1465,6 +1717,7 @@ function renderOrgCards(){
           <div class="org-meta">${devCount} device · ${onlineCount} online · ${oSites.length} sedi</div>
         </div>
         <div class="org-actions" onclick="event.stopPropagation()">
+          <button class="btn btn-p" style="padding:5px 9px;font-size:10px" onclick="event.stopPropagation();showDocumentation('${o.id}')">&#128196;</button>
           <button class="btn btn-b" style="padding:5px 9px;font-size:10px" onclick="openNewSite('${o.id}')">+ Sede</button>
           <button class="btn btn-g" style="padding:5px 9px;font-size:10px" onclick="openEditOrg('${o.id}')">✏</button>
           <button class="btn btn-d" style="padding:5px 9px;font-size:10px" onclick="deleteOrg('${o.id}')">✕</button>
@@ -1508,6 +1761,7 @@ function showOrgDetail(oid, sid=null, did=null){
       <div style="width:12px;height:12px;border-radius:50%;background:${org.color}"></div>
       <div style="font-size:16px;font-weight:800">${org.name}</div>
       <div style="margin-left:auto;display:flex;gap:8px">
+        <button class="btn btn-p" onclick="showDocumentation('${oid}')">&#128196; Documentazione</button>
         <button class="btn btn-b" onclick="openNewSite('${oid}')">+ Sede</button>
         <button class="btn btn-g" onclick="openEditOrg('${oid}')">✏ Modifica</button>
       </div>
@@ -1676,6 +1930,501 @@ function showView(name,el){
 async function loadDemo(){await api('/api/demo',{method:'POST'});toast('Demo caricata!');refreshAll()}
 function toast(msg,type='ok'){const el=document.createElement('div');el.className='toast';el.style.borderColor=type==='err'?'rgba(255,71,87,.4)':'rgba(0,212,170,.3)';el.innerHTML=`<span style="color:${type==='err'?'var(--red)':'var(--accent)'}">${type==='err'?'✕':'✓'}</span> ${msg}`;document.getElementById('toasts').appendChild(el);setTimeout(()=>el.remove(),3200)}
 function clock(){document.getElementById('clk').textContent=new Date().toLocaleTimeString('it-IT',{hour:'2-digit',minute:'2-digit'})}
+
+
+// ── DOCUMENTATION ─────────────────────────────────────────────
+let currentDocOrg = null;
+let currentDocTab = 'apps';
+let docApps=[], docKb=[], docChecklists=[], docWiki=[];
+
+async function showDocumentation(oid) {
+  currentDocOrg = oid;
+  const org = allOrgs.find(o=>o.id===oid);
+  document.getElementById('breadcrumb').innerHTML = `&nbsp;/&nbsp;<span style="color:var(--accent)">${org?.name||'—'}</span> / Documentazione`;
+  await loadAllDocs(oid);
+  renderDocView();
+  showView('org-docs', null);
+}
+
+async function loadAllDocs(oid) {
+  [docApps, docKb, docChecklists, docWiki] = await Promise.all([
+    api(`/api/orgs/${oid}/docs/apps`),
+    api(`/api/orgs/${oid}/docs/kb`),
+    api(`/api/orgs/${oid}/docs/checklists`),
+    api(`/api/orgs/${oid}/docs/wiki`),
+  ]);
+}
+
+function setDocTab(tab) {
+  currentDocTab = tab;
+  document.querySelectorAll('.doc-tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('dtab-'+tab).classList.add('active');
+  renderDocContent();
+}
+
+function renderDocView() {
+  const org = allOrgs.find(o=>o.id===currentDocOrg);
+  document.getElementById('doc-org-title').innerHTML = `
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:20px">
+      <div style="width:10px;height:10px;border-radius:50%;background:${org?.color||'#00d4aa'}"></div>
+      <div style="font-size:16px;font-weight:800">${org?.name||'—'}</div>
+      <div style="font-size:11px;color:var(--text3);background:var(--bg3);padding:3px 10px;border-radius:20px;font-family:monospace">Documentazione</div>
+      <div style="margin-left:auto">
+        <button class="btn btn-g" style="font-size:11px" onclick="showOrgDetail('${currentDocOrg}')">← Torna all'org</button>
+      </div>
+    </div>
+    <div style="display:flex;gap:6px;margin-bottom:20px;border-bottom:1px solid var(--border);padding-bottom:0">
+      <button class="tab doc-tab active" id="dtab-apps"    onclick="setDocTab('apps')">🖥 App e Servizi</button>
+      <button class="tab doc-tab"        id="dtab-kb"      onclick="setDocTab('kb')">📚 Knowledge Base</button>
+      <button class="tab doc-tab"        id="dtab-checks"  onclick="setDocTab('checks')">✅ Checklist</button>
+      <button class="tab doc-tab"        id="dtab-wiki"    onclick="setDocTab('wiki')">📝 Wiki / Note</button>
+    </div>`;
+  renderDocContent();
+}
+
+function renderDocContent() {
+  const el = document.getElementById('doc-content');
+  if (currentDocTab === 'apps')   el.innerHTML = renderApps();
+  if (currentDocTab === 'kb')     el.innerHTML = renderKb();
+  if (currentDocTab === 'checks') el.innerHTML = renderChecklists();
+  if (currentDocTab === 'wiki')   el.innerHTML = renderWiki();
+}
+
+// ── APP E SERVIZI ─────────────────────────────────────────────
+function renderApps() {
+  const cats = [...new Set(docApps.map(a=>a.category||'Software'))];
+  const today = new Date().toISOString().slice(0,10);
+  return `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <div style="font-size:13px;font-weight:700">🖥 App e Servizi <span style="font-size:10px;color:var(--text3);font-family:monospace">(${docApps.length})</span></div>
+      <button class="btn btn-p" onclick="openNewApp()">+ Aggiungi</button>
+    </div>
+    ${!docApps.length ? `<div class="empty"><div class="empty-icon">🖥</div>Nessuna app registrata</div>` :
+    `<div style="overflow-x:auto">
+      <table class="dev-table">
+        <thead><tr><th>App / Servizio</th><th>Categoria</th><th>Versione</th><th>Licenza</th><th>Posti</th><th>Scadenza</th><th>Note</th><th></th></tr></thead>
+        <tbody>
+        ${docApps.map(a => {
+          const exp = a.license_expiry;
+          const expiring = exp && exp <= new Date(Date.now()+30*86400000).toISOString().slice(0,10);
+          const expired  = exp && exp < today;
+          return `<tr>
+            <td><span style="font-weight:700;color:var(--text)">${esc(a.name)}</span></td>
+            <td><span class="tag tag-dept">${esc(a.category||'—')}</span></td>
+            <td><span style="font-family:monospace;font-size:11px;color:var(--text2)">${esc(a.version||'—')}</span></td>
+            <td><span style="font-size:11px">${esc(a.license_type||'—')}</span></td>
+            <td><span style="font-family:monospace;font-size:11px;color:var(--accent)">${a.license_count||'—'}</span></td>
+            <td><span style="font-size:11px;font-family:monospace;color:${expired?'var(--red)':expiring?'var(--orange)':'var(--text2)'}">${exp||'—'}${expired?' ⚠':expiring?' ⏰':''}</span></td>
+            <td><span style="font-size:11px;color:var(--text2)">${esc(a.notes||'—').slice(0,40)}</span></td>
+            <td style="white-space:nowrap">
+              <button class="btn btn-g" style="font-size:10px;padding:4px 8px" onclick="openEditApp('${a.id}')">✏</button>
+              <button class="btn btn-d" style="font-size:10px;padding:4px 8px" onclick="deleteApp('${a.id}')">✕</button>
+            </td>
+          </tr>`;
+        }).join('')}
+        </tbody>
+      </table>
+    </div>`}`;
+}
+
+function openNewApp() {
+  showModal('Nuova App / Servizio', `
+    <div class="igrid">
+      <div class="form-row"><label class="form-label">Nome *</label><input class="form-input" id="fa-name" placeholder="es. Microsoft 365"></div>
+      <div class="form-row"><label class="form-label">Categoria</label>
+        <select class="form-select" id="fa-cat">
+          <option>Software</option><option>SaaS</option><option>Antivirus</option><option>Backup</option><option>VPN</option><option>Database</option><option>Altro</option>
+        </select>
+      </div>
+    </div>
+    <div class="igrid">
+      <div class="form-row"><label class="form-label">Versione</label><input class="form-input" id="fa-ver" placeholder="es. 2024"></div>
+      <div class="form-row"><label class="form-label">Tipo licenza</label><input class="form-input" id="fa-ltype" placeholder="es. Abbonamento annuale"></div>
+    </div>
+    <div class="igrid">
+      <div class="form-row"><label class="form-label">N° posti</label><input class="form-input" id="fa-lcnt" type="number" min="0" placeholder="0"></div>
+      <div class="form-row"><label class="form-label">Scadenza licenza</label><input class="form-input" id="fa-lexp" type="date"></div>
+    </div>
+    <div class="form-row"><label class="form-label">Note</label><textarea class="note-area" id="fa-notes" rows="2" placeholder="Note aggiuntive..."></textarea></div>
+    <div class="form-actions">
+      <button class="btn btn-p" onclick="saveApp()">Salva</button>
+      <button class="btn btn-g" onclick="closeModal()">Annulla</button>
+    </div>`);
+}
+
+async function saveApp() {
+  const name = document.getElementById('fa-name').value.trim();
+  if(!name){toast('Inserisci il nome','err');return}
+  const body = {
+    name, category: document.getElementById('fa-cat').value,
+    version: document.getElementById('fa-ver').value,
+    license_type: document.getElementById('fa-ltype').value,
+    license_count: parseInt(document.getElementById('fa-lcnt').value)||0,
+    license_expiry: document.getElementById('fa-lexp').value,
+    notes: document.getElementById('fa-notes').value
+  };
+  await api(`/api/orgs/${currentDocOrg}/docs/apps`, {method:'POST',body:JSON.stringify(body)});
+  closeModal(); toast('App aggiunta!');
+  docApps = await api(`/api/orgs/${currentDocOrg}/docs/apps`);
+  renderDocContent();
+}
+
+function openEditApp(aid) {
+  const a = docApps.find(x=>x.id===aid); if(!a) return;
+  showModal(`Modifica — ${a.name}`, `
+    <div class="igrid">
+      <div class="form-row"><label class="form-label">Nome *</label><input class="form-input" id="fa-name" value="${esc(a.name)}"></div>
+      <div class="form-row"><label class="form-label">Categoria</label>
+        <select class="form-select" id="fa-cat">
+          ${['Software','SaaS','Antivirus','Backup','VPN','Database','Altro'].map(c=>`<option${c===a.category?' selected':''}>${c}</option>`).join('')}
+        </select>
+      </div>
+    </div>
+    <div class="igrid">
+      <div class="form-row"><label class="form-label">Versione</label><input class="form-input" id="fa-ver" value="${esc(a.version||'')}"></div>
+      <div class="form-row"><label class="form-label">Tipo licenza</label><input class="form-input" id="fa-ltype" value="${esc(a.license_type||'')}"></div>
+    </div>
+    <div class="igrid">
+      <div class="form-row"><label class="form-label">N° posti</label><input class="form-input" id="fa-lcnt" type="number" value="${a.license_count||0}"></div>
+      <div class="form-row"><label class="form-label">Scadenza</label><input class="form-input" id="fa-lexp" type="date" value="${a.license_expiry||''}"></div>
+    </div>
+    <div class="form-row"><label class="form-label">Note</label><textarea class="note-area" id="fa-notes" rows="2">${esc(a.notes||'')}</textarea></div>
+    <div class="form-actions">
+      <button class="btn btn-p" onclick="updateApp('${aid}')">Salva</button>
+      <button class="btn btn-g" onclick="closeModal()">Annulla</button>
+    </div>`);
+}
+
+async function updateApp(aid) {
+  const body = {
+    name: document.getElementById('fa-name').value.trim(),
+    category: document.getElementById('fa-cat').value,
+    version: document.getElementById('fa-ver').value,
+    license_type: document.getElementById('fa-ltype').value,
+    license_count: parseInt(document.getElementById('fa-lcnt').value)||0,
+    license_expiry: document.getElementById('fa-lexp').value,
+    notes: document.getElementById('fa-notes').value
+  };
+  await api(`/api/orgs/${currentDocOrg}/docs/apps/${aid}`, {method:'PATCH',body:JSON.stringify(body)});
+  closeModal(); toast('Salvato!');
+  docApps = await api(`/api/orgs/${currentDocOrg}/docs/apps`);
+  renderDocContent();
+}
+
+async function deleteApp(aid) {
+  if(!confirm('Eliminare questa app?')) return;
+  await api(`/api/orgs/${currentDocOrg}/docs/apps/${aid}`, {method:'DELETE'});
+  toast('Eliminata'); docApps = docApps.filter(a=>a.id!==aid); renderDocContent();
+}
+
+// ── KNOWLEDGE BASE ────────────────────────────────────────────
+function renderKb() {
+  const cats = [...new Set(docKb.map(k=>k.category||'Generale'))];
+  return `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <div style="font-size:13px;font-weight:700">📚 Knowledge Base <span style="font-size:10px;color:var(--text3);font-family:monospace">(${docKb.length} articoli)</span></div>
+      <button class="btn btn-p" onclick="openNewKb()">+ Nuovo articolo</button>
+    </div>
+    ${!docKb.length ? `<div class="empty"><div class="empty-icon">📚</div>Nessun articolo nella KB</div>` :
+    `<div style="display:flex;flex-direction:column;gap:10px">
+      ${docKb.map(k=>`
+        <div class="panel" style="cursor:pointer" onclick="openKbDetail('${k.id}')">
+          <div style="padding:14px 18px;display:flex;align-items:center;gap:12px">
+            <div style="flex:1">
+              <div style="font-size:13px;font-weight:700;margin-bottom:4px">${esc(k.title)}</div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap">
+                <span class="tag tag-dept">${esc(k.category||'Generale')}</span>
+                ${k.tags ? k.tags.split(',').filter(Boolean).map(t=>`<span style="font-size:9px;background:var(--bg4);color:var(--text3);padding:2px 7px;border-radius:4px">${esc(t.trim())}</span>`).join('') : ''}
+              </div>
+            </div>
+            <div style="text-align:right">
+              <div style="font-size:10px;color:var(--text3);font-family:monospace">${k.updated_at?.slice(0,10)||'—'}</div>
+              <div style="display:flex;gap:5px;margin-top:6px">
+                <button class="btn btn-g" style="font-size:10px;padding:4px 8px" onclick="event.stopPropagation();openEditKb('${k.id}')">✏</button>
+                <button class="btn btn-d" style="font-size:10px;padding:4px 8px" onclick="event.stopPropagation();deleteKb('${k.id}')">✕</button>
+              </div>
+            </div>
+          </div>
+          ${k.content ? `<div style="padding:0 18px 14px;font-size:11px;color:var(--text2);line-height:1.6;white-space:pre-wrap;max-height:60px;overflow:hidden;mask-image:linear-gradient(to bottom,black 60%,transparent)">${esc(k.content.slice(0,200))}</div>` : ''}
+        </div>`).join('')}
+    </div>`}`;
+}
+
+function openNewKb() {
+  showModal('Nuovo Articolo KB', `
+    <div class="form-row"><label class="form-label">Titolo *</label><input class="form-input" id="fk-title" placeholder="es. Come configurare la VPN"></div>
+    <div class="igrid">
+      <div class="form-row"><label class="form-label">Categoria</label>
+        <select class="form-select" id="fk-cat">
+          <option>Generale</option><option>Rete</option><option>Hardware</option><option>Software</option><option>Sicurezza</option><option>Procedure</option>
+        </select>
+      </div>
+      <div class="form-row"><label class="form-label">Tag (separati da virgola)</label><input class="form-input" id="fk-tags" placeholder="vpn, accesso, remoto"></div>
+    </div>
+    <div class="form-row"><label class="form-label">Contenuto</label><textarea class="note-area" id="fk-content" rows="8" placeholder="Scrivi l'articolo qui..."></textarea></div>
+    <div class="form-actions">
+      <button class="btn btn-p" onclick="saveKb()">Salva</button>
+      <button class="btn btn-g" onclick="closeModal()">Annulla</button>
+    </div>`);
+}
+
+async function saveKb() {
+  const title = document.getElementById('fk-title').value.trim();
+  if(!title){toast('Inserisci il titolo','err');return}
+  const body = {title, category: document.getElementById('fk-cat').value,
+    tags: document.getElementById('fk-tags').value, content: document.getElementById('fk-content').value};
+  await api(`/api/orgs/${currentDocOrg}/docs/kb`, {method:'POST',body:JSON.stringify(body)});
+  closeModal(); toast('Articolo creato!');
+  docKb = await api(`/api/orgs/${currentDocOrg}/docs/kb`); renderDocContent();
+}
+
+function openEditKb(kid) {
+  const k = docKb.find(x=>x.id===kid); if(!k) return;
+  showModal(`Modifica — ${k.title}`, `
+    <div class="form-row"><label class="form-label">Titolo *</label><input class="form-input" id="fk-title" value="${esc(k.title)}"></div>
+    <div class="igrid">
+      <div class="form-row"><label class="form-label">Categoria</label>
+        <select class="form-select" id="fk-cat">
+          ${['Generale','Rete','Hardware','Software','Sicurezza','Procedure'].map(c=>`<option${c===k.category?' selected':''}>${c}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-row"><label class="form-label">Tag</label><input class="form-input" id="fk-tags" value="${esc(k.tags||'')}"></div>
+    </div>
+    <div class="form-row"><label class="form-label">Contenuto</label><textarea class="note-area" id="fk-content" rows="10">${esc(k.content||'')}</textarea></div>
+    <div class="form-actions">
+      <button class="btn btn-p" onclick="updateKb('${kid}')">Salva</button>
+      <button class="btn btn-g" onclick="closeModal()">Annulla</button>
+    </div>`);
+}
+
+async function updateKb(kid) {
+  const body = {title: document.getElementById('fk-title').value.trim(),
+    category: document.getElementById('fk-cat').value,
+    tags: document.getElementById('fk-tags').value,
+    content: document.getElementById('fk-content').value};
+  await api(`/api/orgs/${currentDocOrg}/docs/kb/${kid}`, {method:'PATCH',body:JSON.stringify(body)});
+  closeModal(); toast('Salvato!');
+  docKb = await api(`/api/orgs/${currentDocOrg}/docs/kb`); renderDocContent();
+}
+
+async function deleteKb(kid) {
+  if(!confirm('Eliminare questo articolo?')) return;
+  await api(`/api/orgs/${currentDocOrg}/docs/kb/${kid}`, {method:'DELETE'});
+  toast('Eliminato'); docKb = docKb.filter(k=>k.id!==kid); renderDocContent();
+}
+
+function openKbDetail(kid) {
+  const k = docKb.find(x=>x.id===kid); if(!k) return;
+  showModal(k.title, `
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px">
+      <span class="tag tag-dept">${esc(k.category||'Generale')}</span>
+      ${(k.tags||'').split(',').filter(Boolean).map(t=>`<span style="font-size:9px;background:var(--bg4);color:var(--text3);padding:2px 7px;border-radius:4px">${esc(t.trim())}</span>`).join('')}
+      <span style="margin-left:auto;font-size:10px;color:var(--text3);font-family:monospace">Aggiornato: ${k.updated_at?.slice(0,10)||'—'}</span>
+    </div>
+    <div style="background:var(--bg3);border-radius:8px;padding:16px;font-size:13px;line-height:1.8;white-space:pre-wrap;max-height:60vh;overflow-y:auto">${esc(k.content||'Nessun contenuto.')}</div>
+    <div style="display:flex;gap:8px;margin-top:14px">
+      <button class="btn btn-b" onclick="closeModal();openEditKb('${kid}')">✏ Modifica</button>
+      <button class="btn btn-g" onclick="closeModal()">Chiudi</button>
+    </div>`);
+}
+
+// ── CHECKLIST ─────────────────────────────────────────────────
+function renderChecklists() {
+  return `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <div style="font-size:13px;font-weight:700">✅ Elenchi di controllo <span style="font-size:10px;color:var(--text3);font-family:monospace">(${docChecklists.length})</span></div>
+      <button class="btn btn-p" onclick="openNewChecklist()">+ Nuova checklist</button>
+    </div>
+    ${!docChecklists.length ? `<div class="empty"><div class="empty-icon">✅</div>Nessuna checklist</div>` :
+    `<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px">
+      ${docChecklists.map(cl => {
+        const total = cl.items?.length || 0;
+        const done  = cl.items?.filter(i=>i.checked).length || 0;
+        const pct   = total ? Math.round(done/total*100) : 0;
+        return `<div class="panel">
+          <div style="padding:14px 18px;border-bottom:1px solid var(--border)">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+              <div style="font-size:13px;font-weight:700">${esc(cl.name)}</div>
+              <div style="display:flex;gap:5px">
+                <button class="btn btn-b" style="font-size:10px;padding:4px 8px" onclick="openAddCheckItem('${cl.id}')">+</button>
+                <button class="btn btn-g" style="font-size:10px;padding:4px 8px" onclick="openEditChecklist('${cl.id}')">✏</button>
+                <button class="btn btn-d" style="font-size:10px;padding:4px 8px" onclick="deleteChecklist('${cl.id}')">✕</button>
+              </div>
+            </div>
+            ${cl.description ? `<div style="font-size:11px;color:var(--text2);margin-bottom:8px">${esc(cl.description)}</div>` : ''}
+            <div style="display:flex;align-items:center;gap:8px">
+              <div style="flex:1;height:4px;background:var(--bg4);border-radius:4px;overflow:hidden">
+                <div style="height:100%;background:${pct===100?'var(--green)':pct>50?'var(--accent2)':'var(--orange)'};width:${pct}%;border-radius:4px;transition:width .3s"></div>
+              </div>
+              <span style="font-size:10px;color:var(--text2);font-family:monospace">${done}/${total}</span>
+            </div>
+          </div>
+          <div style="padding:10px 18px;max-height:240px;overflow-y:auto">
+            ${!cl.items?.length ? `<div style="font-size:11px;color:var(--text3);padding:6px 0">Nessun elemento. Clicca + per aggiungere.</div>` :
+              cl.items.map(item => `
+                <div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid rgba(42,53,71,.3)">
+                  <input type="checkbox" ${item.checked?'checked':''} onchange="toggleCheckItem('${cl.id}','${item.id}',this.checked)"
+                    style="width:16px;height:16px;accent-color:var(--accent);cursor:pointer;flex-shrink:0">
+                  <span style="font-size:12px;flex:1;${item.checked?'text-decoration:line-through;color:var(--text3)':''}">${esc(item.text)}</span>
+                  <button onclick="deleteCheckItem('${cl.id}','${item.id}')" style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:12px;padding:0 4px">×</button>
+                </div>`).join('')}
+          </div>
+        </div>`;
+      }).join('')}
+    </div>`}`;
+}
+
+function openNewChecklist() {
+  showModal('Nuova Checklist', `
+    <div class="form-row"><label class="form-label">Nome *</label><input class="form-input" id="fc-name" placeholder="es. Onboarding nuovo dipendente"></div>
+    <div class="form-row"><label class="form-label">Descrizione</label><input class="form-input" id="fc-desc" placeholder="Opzionale"></div>
+    <div class="form-actions">
+      <button class="btn btn-p" onclick="saveChecklist()">Crea</button>
+      <button class="btn btn-g" onclick="closeModal()">Annulla</button>
+    </div>`);
+}
+
+async function saveChecklist() {
+  const name = document.getElementById('fc-name').value.trim();
+  if(!name){toast('Inserisci il nome','err');return}
+  await api(`/api/orgs/${currentDocOrg}/docs/checklists`, {method:'POST',body:JSON.stringify({name, description: document.getElementById('fc-desc').value})});
+  closeModal(); toast('Checklist creata!');
+  docChecklists = await api(`/api/orgs/${currentDocOrg}/docs/checklists`); renderDocContent();
+}
+
+function openEditChecklist(cid) {
+  const cl = docChecklists.find(x=>x.id===cid); if(!cl) return;
+  showModal(`Modifica — ${cl.name}`, `
+    <div class="form-row"><label class="form-label">Nome *</label><input class="form-input" id="fc-name" value="${esc(cl.name)}"></div>
+    <div class="form-row"><label class="form-label">Descrizione</label><input class="form-input" id="fc-desc" value="${esc(cl.description||'')}"></div>
+    <div class="form-actions">
+      <button class="btn btn-p" onclick="updateChecklist('${cid}')">Salva</button>
+      <button class="btn btn-g" onclick="closeModal()">Annulla</button>
+    </div>`);
+}
+
+async function updateChecklist(cid) {
+  await api(`/api/orgs/${currentDocOrg}/docs/checklists/${cid}`, {method:'PATCH',body:JSON.stringify({name: document.getElementById('fc-name').value.trim(), description: document.getElementById('fc-desc').value})});
+  closeModal(); toast('Salvato!');
+  docChecklists = await api(`/api/orgs/${currentDocOrg}/docs/checklists`); renderDocContent();
+}
+
+async function deleteChecklist(cid) {
+  if(!confirm('Eliminare questa checklist e tutti i suoi elementi?')) return;
+  await api(`/api/orgs/${currentDocOrg}/docs/checklists/${cid}`, {method:'DELETE'});
+  toast('Eliminata'); docChecklists = docChecklists.filter(c=>c.id!==cid); renderDocContent();
+}
+
+function openAddCheckItem(cid) {
+  showModal('Aggiungi elemento', `
+    <div class="form-row"><label class="form-label">Testo elemento *</label><input class="form-input" id="fi-text" placeholder="es. Creare account email aziendale" autofocus></div>
+    <div class="form-actions">
+      <button class="btn btn-p" onclick="saveCheckItem('${cid}')">Aggiungi</button>
+      <button class="btn btn-g" onclick="closeModal()">Annulla</button>
+    </div>`);
+  setTimeout(()=>document.getElementById('fi-text')?.focus(),100);
+}
+
+async function saveCheckItem(cid) {
+  const text = document.getElementById('fi-text').value.trim();
+  if(!text){toast('Inserisci il testo','err');return}
+  await api(`/api/orgs/${currentDocOrg}/docs/checklists/${cid}/items`, {method:'POST',body:JSON.stringify({text})});
+  closeModal(); toast('Elemento aggiunto!');
+  docChecklists = await api(`/api/orgs/${currentDocOrg}/docs/checklists`); renderDocContent();
+}
+
+async function toggleCheckItem(cid, iid, checked) {
+  await api(`/api/orgs/${currentDocOrg}/docs/checklists/${cid}/items/${iid}`, {method:'PATCH',body:JSON.stringify({checked})});
+  const cl = docChecklists.find(c=>c.id===cid);
+  if(cl){const item=cl.items?.find(i=>i.id===iid);if(item)item.checked=checked?1:0;}
+  // Re-render solo la sezione progress senza reload completo
+  docChecklists = await api(`/api/orgs/${currentDocOrg}/docs/checklists`); renderDocContent();
+}
+
+async function deleteCheckItem(cid, iid) {
+  await api(`/api/orgs/${currentDocOrg}/docs/checklists/${cid}/items/${iid}`, {method:'DELETE'});
+  docChecklists = await api(`/api/orgs/${currentDocOrg}/docs/checklists`); renderDocContent();
+}
+
+// ── WIKI / NOTE ───────────────────────────────────────────────
+function renderWiki() {
+  return `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <div style="font-size:13px;font-weight:700">📝 Wiki / Note libere <span style="font-size:10px;color:var(--text3);font-family:monospace">(${docWiki.length})</span></div>
+      <button class="btn btn-p" onclick="openNewWiki()">+ Nuova nota</button>
+    </div>
+    ${!docWiki.length ? `<div class="empty"><div class="empty-icon">📝</div>Nessuna nota wiki</div>` :
+    `<div style="display:flex;flex-direction:column;gap:10px">
+      ${docWiki.map(w=>`
+        <div class="panel" style="cursor:pointer" onclick="openWikiDetail('${w.id}')">
+          <div style="padding:14px 18px;display:flex;align-items:center;gap:12px">
+            <div style="flex:1">
+              <div style="font-size:13px;font-weight:700">${esc(w.title)}</div>
+              ${w.content ? `<div style="font-size:11px;color:var(--text2);margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:500px">${esc(w.content.slice(0,120))}</div>` : ''}
+            </div>
+            <div style="text-align:right;flex-shrink:0">
+              <div style="font-size:10px;color:var(--text3);font-family:monospace">${w.updated_at?.slice(0,10)||'—'}</div>
+              <div style="display:flex;gap:5px;margin-top:6px;justify-content:flex-end">
+                <button class="btn btn-g" style="font-size:10px;padding:4px 8px" onclick="event.stopPropagation();openEditWiki('${w.id}')">✏</button>
+                <button class="btn btn-d" style="font-size:10px;padding:4px 8px" onclick="event.stopPropagation();deleteWiki('${w.id}')">✕</button>
+              </div>
+            </div>
+          </div>
+        </div>`).join('')}
+    </div>`}`;
+}
+
+function openNewWiki() {
+  showModal('Nuova nota Wiki', `
+    <div class="form-row"><label class="form-label">Titolo *</label><input class="form-input" id="fw-title" placeholder="es. Credenziali server NAS"></div>
+    <div class="form-row"><label class="form-label">Contenuto (testo libero o markdown)</label><textarea class="note-area" id="fw-content" rows="10" placeholder="Scrivi qui le note..."></textarea></div>
+    <div class="form-actions">
+      <button class="btn btn-p" onclick="saveWiki()">Salva</button>
+      <button class="btn btn-g" onclick="closeModal()">Annulla</button>
+    </div>`);
+}
+
+async function saveWiki() {
+  const title = document.getElementById('fw-title').value.trim();
+  if(!title){toast('Inserisci il titolo','err');return}
+  await api(`/api/orgs/${currentDocOrg}/docs/wiki`, {method:'POST',body:JSON.stringify({title, content: document.getElementById('fw-content').value})});
+  closeModal(); toast('Nota salvata!');
+  docWiki = await api(`/api/orgs/${currentDocOrg}/docs/wiki`); renderDocContent();
+}
+
+function openEditWiki(wid) {
+  const w = docWiki.find(x=>x.id===wid); if(!w) return;
+  showModal(`Modifica — ${w.title}`, `
+    <div class="form-row"><label class="form-label">Titolo *</label><input class="form-input" id="fw-title" value="${esc(w.title)}"></div>
+    <div class="form-row"><label class="form-label">Contenuto</label><textarea class="note-area" id="fw-content" rows="12">${esc(w.content||'')}</textarea></div>
+    <div class="form-actions">
+      <button class="btn btn-p" onclick="updateWiki('${wid}')">Salva</button>
+      <button class="btn btn-g" onclick="closeModal()">Annulla</button>
+    </div>`);
+}
+
+async function updateWiki(wid) {
+  await api(`/api/orgs/${currentDocOrg}/docs/wiki/${wid}`, {method:'PATCH',body:JSON.stringify({title: document.getElementById('fw-title').value.trim(), content: document.getElementById('fw-content').value})});
+  closeModal(); toast('Salvato!');
+  docWiki = await api(`/api/orgs/${currentDocOrg}/docs/wiki`); renderDocContent();
+}
+
+async function deleteWiki(wid) {
+  if(!confirm('Eliminare questa nota?')) return;
+  await api(`/api/orgs/${currentDocOrg}/docs/wiki/${wid}`, {method:'DELETE'});
+  toast('Eliminata'); docWiki = docWiki.filter(w=>w.id!==wid); renderDocContent();
+}
+
+function openWikiDetail(wid) {
+  const w = docWiki.find(x=>x.id===wid); if(!w) return;
+  showModal(w.title, `
+    <div style="font-size:10px;color:var(--text3);font-family:monospace;margin-bottom:14px">Aggiornato: ${w.updated_at?.slice(0,10)||'—'}</div>
+    <div style="background:var(--bg3);border-radius:8px;padding:16px;font-size:13px;line-height:1.8;white-space:pre-wrap;max-height:65vh;overflow-y:auto">${esc(w.content||'Nessun contenuto.')}</div>
+    <div style="display:flex;gap:8px;margin-top:14px">
+      <button class="btn btn-b" onclick="closeModal();openEditWiki('${wid}')">✏ Modifica</button>
+      <button class="btn btn-g" onclick="closeModal()">Chiudi</button>
+    </div>`);
+}
 
 // ── INIT ──────────────────────────────────────────────────────
 (async()=>{
