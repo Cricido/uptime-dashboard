@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: uptime-dashboard
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn server:app
+    envVars:
+      - key: UPTIME_API_KEY
+        value: uptime-sos-2025
