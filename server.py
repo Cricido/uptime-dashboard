@@ -138,6 +138,17 @@ def init_db():
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS doc_passwords (
+            id TEXT PRIMARY KEY,
+            oid TEXT NOT NULL,
+            title TEXT NOT NULL,
+            username TEXT DEFAULT '',
+            password TEXT NOT NULL,
+            url TEXT DEFAULT '',
+            notes TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
         """)
         if not db.execute("SELECT 1 FROM users LIMIT 1").fetchone():
             uid = _new_uid()
@@ -939,6 +950,90 @@ def delete_doc_wiki(oid, wid):
         db.execute("DELETE FROM doc_wiki WHERE id=? AND oid=?", (wid, oid))
         db.commit()
     return jsonify({"ok":True})
+
+
+# ── Password Vault API ────────────────────────────────────────
+@app.route("/api/orgs/<oid>/docs/passwords", methods=["GET"])
+@require_api_key
+def get_doc_passwords(oid):
+    with get_db() as db:
+        rows = _rows(db.execute(
+            "SELECT id,oid,title,username,url,notes,created_at,updated_at FROM doc_passwords WHERE oid=? ORDER BY title",
+            (oid,)
+        ).fetchall())
+    return jsonify(rows)
+
+@app.route("/api/orgs/<oid>/docs/passwords/reveal/<pid>", methods=["POST"])
+@require_api_key
+def reveal_password(oid, pid):
+    """Rivela la password dopo verifica credenziali o 2FA"""
+    d = request.json or {}
+    method = d.get("method")  # "password" or "totp"
+    u, s = _current_user()
+    if not u: abort(401)
+    if method == "password":
+        provided = d.get("value","")
+        if u["password_hash"] != _hash(provided):
+            return jsonify({"ok": False, "error": "Password non corretta"}), 401
+    elif method == "totp":
+        code = d.get("value","").replace(" ","")
+        if not u.get("totp_enabled"):
+            return jsonify({"ok": False, "error": "2FA non attivo per questo utente"}), 400
+        if not _totp_verify(u["totp_secret"], code):
+            return jsonify({"ok": False, "error": "Codice 2FA non valido"}), 401
+    else:
+        return jsonify({"ok": False, "error": "Metodo non valido"}), 400
+    with get_db() as db:
+        row = _row(db.execute(
+            "SELECT password FROM doc_passwords WHERE id=? AND oid=?", (pid, oid)
+        ).fetchone())
+    if not row: abort(404)
+    return jsonify({"ok": True, "password": row["password"]})
+
+@app.route("/api/orgs/<oid>/docs/passwords", methods=["POST"])
+@require_api_key
+def create_doc_password(oid):
+    d = request.json or {}
+    pid = _new_uid()
+    now = _now()
+    row = {
+        "id": pid, "oid": oid,
+        "title":    d.get("title",""),
+        "username": d.get("username",""),
+        "password": d.get("password",""),
+        "url":      d.get("url",""),
+        "notes":    d.get("notes",""),
+        "created_at": now, "updated_at": now
+    }
+    with get_db() as db:
+        db.execute(
+            "INSERT INTO doc_passwords VALUES (?,?,?,?,?,?,?,?,?)",
+            (row["id"],row["oid"],row["title"],row["username"],
+             row["password"],row["url"],row["notes"],row["created_at"],row["updated_at"])
+        )
+        db.commit()
+    row.pop("password")  # non restituire mai la password in chiaro
+    return jsonify(row)
+
+@app.route("/api/orgs/<oid>/docs/passwords/<pid>", methods=["PATCH"])
+@require_api_key
+def update_doc_password(oid, pid):
+    d = request.json or {}
+    with get_db() as db:
+        if not db.execute("SELECT 1 FROM doc_passwords WHERE id=? AND oid=?", (pid,oid)).fetchone(): abort(404)
+        for k in ["title","username","password","url","notes"]:
+            if k in d: db.execute(f"UPDATE doc_passwords SET {k}=? WHERE id=?", (d[k], pid))
+        db.execute("UPDATE doc_passwords SET updated_at=? WHERE id=?", (_now(), pid))
+        db.commit()
+    return jsonify({"ok": True})
+
+@app.route("/api/orgs/<oid>/docs/passwords/<pid>", methods=["DELETE"])
+@require_api_key
+def delete_doc_password(oid, pid):
+    with get_db() as db:
+        db.execute("DELETE FROM doc_passwords WHERE id=? AND oid=?", (pid, oid))
+        db.commit()
+    return jsonify({"ok": True})
 
 # HTML TEMPLATES
 # ═══════════════════════════════════════════════════════════════
@@ -1933,7 +2028,7 @@ function clock(){document.getElementById('clk').textContent=new Date().toLocaleT
 // ── DOCUMENTATION ─────────────────────────────────────────────
 let currentDocOrg = null;
 let currentDocTab = 'apps';
-let docApps=[], docKb=[], docChecklists=[], docWiki=[];
+let docApps=[], docKb=[], docChecklists=[], docWiki=[], docPasswords=[];
 
 async function showDocumentation(oid) {
   currentDocOrg = oid;
@@ -1945,11 +2040,12 @@ async function showDocumentation(oid) {
 }
 
 async function loadAllDocs(oid) {
-  [docApps, docKb, docChecklists, docWiki] = await Promise.all([
+  [docApps, docKb, docChecklists, docWiki, docPasswords] = await Promise.all([
     api(`/api/orgs/${oid}/docs/apps`),
     api(`/api/orgs/${oid}/docs/kb`),
     api(`/api/orgs/${oid}/docs/checklists`),
     api(`/api/orgs/${oid}/docs/wiki`),
+    api(`/api/orgs/${oid}/docs/passwords`),
   ]);
 }
 
@@ -1976,6 +2072,7 @@ function renderDocView() {
       <button class="tab doc-tab"        id="dtab-kb"      onclick="setDocTab('kb')">📚 Knowledge Base</button>
       <button class="tab doc-tab"        id="dtab-checks"  onclick="setDocTab('checks')">✅ Checklist</button>
       <button class="tab doc-tab"        id="dtab-wiki"    onclick="setDocTab('wiki')">📝 Wiki / Note</button>
+      <button class="tab doc-tab"        id="dtab-passwords" onclick="setDocTab('passwords')">🔑 Password</button>
     </div>`;
   renderDocContent();
 }
@@ -1985,7 +2082,8 @@ function renderDocContent() {
   if (currentDocTab === 'apps')   el.innerHTML = renderApps();
   if (currentDocTab === 'kb')     el.innerHTML = renderKb();
   if (currentDocTab === 'checks') el.innerHTML = renderChecklists();
-  if (currentDocTab === 'wiki')   el.innerHTML = renderWiki();
+  if (currentDocTab === 'wiki')       el.innerHTML = renderWiki();
+  if (currentDocTab === 'passwords')  el.innerHTML = renderPasswords();
 }
 
 // ── APP E SERVIZI ─────────────────────────────────────────────
@@ -2422,6 +2520,293 @@ function openWikiDetail(wid) {
       <button class="btn btn-b" onclick="closeModal();openEditWiki('${wid}')">✏ Modifica</button>
       <button class="btn btn-g" onclick="closeModal()">Chiudi</button>
     </div>`);
+}
+
+// ── PASSWORD VAULT ────────────────────────────────────────────
+let docPasswords = [];
+
+async function loadPasswords(oid) {
+  docPasswords = await api(`/api/orgs/${oid}/docs/passwords`);
+}
+
+function renderPasswords() {
+  return `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <div style="font-size:13px;font-weight:700">🔑 Password Vault
+        <span style="font-size:10px;color:var(--text3);font-family:monospace">(${docPasswords.length})</span>
+      </div>
+      <button class="btn btn-p" onclick="openNewPassword()">+ Aggiungi</button>
+    </div>
+    <div style="background:rgba(255,71,87,.06);border:1px solid rgba(255,71,87,.2);border-radius:8px;padding:10px 14px;margin-bottom:16px;font-size:11px;color:var(--text2);display:flex;align-items:center;gap:8px">
+      🔒 Le password sono cifrate. Per visualizzarle è richiesta la tua password o il codice 2FA.
+    </div>
+    ${!docPasswords.length ? `<div class="empty"><div class="empty-icon">🔑</div>Nessuna password salvata</div>` :
+    `<div style="display:flex;flex-direction:column;gap:8px">
+      ${docPasswords.map(p => `
+        <div class="panel">
+          <div style="padding:14px 18px;display:flex;align-items:center;gap:14px">
+            <div style="width:36px;height:36px;border-radius:9px;background:rgba(0,212,170,.1);border:1px solid rgba(0,212,170,.2);display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0">🔑</div>
+            <div style="flex:1;min-width:0">
+              <div style="font-size:13px;font-weight:700;margin-bottom:3px">${esc(p.title)}</div>
+              <div style="display:flex;gap:16px;flex-wrap:wrap">
+                ${p.username ? `<span style="font-size:11px;color:var(--text2);font-family:monospace">👤 ${esc(p.username)}</span>` : ''}
+                ${p.url ? `<a href="${esc(p.url)}" target="_blank" style="font-size:11px;color:var(--accent2);font-family:monospace;text-decoration:none">🔗 ${esc(p.url.replace(/^https?:\/\//,'').slice(0,40))}</a>` : ''}
+              </div>
+              <div style="display:flex;align-items:center;gap:8px;margin-top:8px">
+                <div style="background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:5px 10px;font-family:monospace;font-size:13px;letter-spacing:3px;color:var(--text3);flex:1;max-width:200px" id="pw-display-${p.id}">••••••••••</div>
+                <button class="btn btn-b" style="font-size:10px;padding:5px 10px" id="pw-btn-${p.id}" onclick="askReveal('${p.id}','${currentDocOrg}')">👁 Mostra</button>
+                <button class="btn btn-g" style="font-size:10px;padding:5px 10px" onclick="copyPassword('${p.id}','${currentDocOrg}')">📋 Copia</button>
+              </div>
+              ${p.notes ? `<div style="font-size:10px;color:var(--text3);margin-top:6px">${esc(p.notes)}</div>` : ''}
+            </div>
+            <div style="display:flex;flex-direction:column;gap:5px;flex-shrink:0">
+              <button class="btn btn-g" style="font-size:10px;padding:5px 8px" onclick="openEditPassword('${p.id}')">✏</button>
+              <button class="btn btn-d" style="font-size:10px;padding:5px 8px" onclick="deletePassword('${p.id}')">✕</button>
+            </div>
+          </div>
+        </div>`).join('')}
+    </div>`}`;
+}
+
+function askReveal(pid, oid) {
+  // Check if user has 2FA enabled
+  const has2fa = currentUser?.totp_enabled;
+  showModal('🔒 Verifica identità', `
+    <div style="text-align:center;margin-bottom:20px">
+      <div style="font-size:40px;margin-bottom:10px">🔐</div>
+      <div style="font-size:13px;color:var(--text2)">Per visualizzare la password conferma la tua identità</div>
+    </div>
+    <div class="tabs" style="margin-bottom:16px;justify-content:center">
+      <div class="tab active" id="vtab-pwd" onclick="switchVerifyTab('pwd')">🔑 Password</div>
+      ${has2fa ? `<div class="tab" id="vtab-totp" onclick="switchVerifyTab('totp')">📱 Codice 2FA</div>` : ''}
+    </div>
+    <div id="verify-pwd-section">
+      <div class="form-row">
+        <label class="form-label">La tua password</label>
+        <input class="form-input" id="v-pwd" type="password" placeholder="Inserisci la tua password" autocomplete="current-password">
+      </div>
+    </div>
+    <div id="verify-totp-section" style="display:none">
+      <div class="form-row">
+        <label class="form-label">Codice Authenticator (6 cifre)</label>
+        <div class="otp-verify-inputs">
+          ${[0,1,2,3,4,5].map(i=>`<input type="text" maxlength="1" id="vt${i}" oninput="vtNext(${i})" onkeydown="vtBack(event,${i})" style="width:38px;height:44px;background:var(--bg3);border:1px solid var(--border);border-radius:7px;color:var(--accent);font-size:20px;font-weight:700;font-family:monospace;text-align:center">`).join('')}
+        </div>
+      </div>
+    </div>
+    <div class="form-actions" style="margin-top:16px">
+      <button class="btn btn-p" onclick="doReveal('${pid}','${oid}')">Verifica e mostra</button>
+      <button class="btn btn-g" onclick="closeModal()">Annulla</button>
+    </div>`);
+  setTimeout(()=>document.getElementById('v-pwd')?.focus(), 100);
+}
+
+function switchVerifyTab(tab) {
+  document.querySelectorAll('.tabs .tab').forEach(t=>t.classList.remove('active'));
+  document.getElementById('vtab-'+tab)?.classList.add('active');
+  document.getElementById('verify-pwd-section').style.display = tab==='pwd'?'block':'none';
+  document.getElementById('verify-totp-section').style.display = tab==='totp'?'block':'none';
+  if(tab==='totp') document.getElementById('vt0')?.focus();
+  else document.getElementById('v-pwd')?.focus();
+}
+
+function vtNext(i){const v=document.getElementById('vt'+i).value;if(v&&i<5)document.getElementById('vt'+(i+1)).focus();if(i===5&&v)doReveal(null,null)}
+function vtBack(e,i){if(e.key==='Backspace'&&!document.getElementById('vt'+i).value&&i>0)document.getElementById('vt'+(i-1)).focus()}
+
+async function doReveal(pid, oid) {
+  // Determine which tab is active
+  const pwdTab = document.getElementById('vtab-pwd')?.classList.contains('active');
+  let method, value;
+  if(pwdTab) {
+    method = 'password';
+    value  = document.getElementById('v-pwd')?.value || '';
+  } else {
+    method = 'totp';
+    value  = [0,1,2,3,4,5].map(i=>document.getElementById('vt'+i)?.value||'').join('');
+  }
+  if(!value){toast('Inserisci le credenziali','err');return}
+
+  try {
+    const r = await api(`/api/orgs/${oid}/docs/passwords/reveal/${pid}`, {
+      method:'POST', body:JSON.stringify({method, value})
+    });
+    if(!r.ok){toast(r.error||'Verifica fallita','err');return}
+    closeModal();
+    // Show password in the display field
+    const el = document.getElementById(`pw-display-${pid}`);
+    const btn = document.getElementById(`pw-btn-${pid}`);
+    if(el) {
+      el.textContent = r.password;
+      el.style.color = 'var(--accent)';
+      el.style.letterSpacing = '1px';
+    }
+    if(btn) {
+      btn.textContent = '🔒 Nascondi';
+      btn.onclick = () => {
+        el.textContent = '••••••••••';
+        el.style.color = 'var(--text3)';
+        el.style.letterSpacing = '3px';
+        btn.textContent = '👁 Mostra';
+        btn.onclick = () => askReveal(pid, oid);
+      };
+    }
+    toast('Password sbloccata — si nasconde dopo 30s');
+    // Auto-hide after 30 seconds
+    setTimeout(()=>{
+      if(el && el.textContent !== '••••••••••'){
+        el.textContent='••••••••••';
+        el.style.color='var(--text3)';
+        el.style.letterSpacing='3px';
+        if(btn){btn.textContent='👁 Mostra';btn.onclick=()=>askReveal(pid,oid);}
+      }
+    }, 30000);
+  } catch(e) { toast('Verifica fallita','err'); }
+}
+
+async function copyPassword(pid, oid) {
+  // Require verification to copy too
+  showModal('🔒 Verifica per copiare', `
+    <div style="text-align:center;margin-bottom:16px">
+      <div style="font-size:36px;margin-bottom:8px">📋</div>
+      <div style="font-size:12px;color:var(--text2)">Inserisci la tua password per copiare negli appunti</div>
+    </div>
+    <div class="form-row">
+      <label class="form-label">La tua password</label>
+      <input class="form-input" id="cp-pwd" type="password" placeholder="Password">
+    </div>
+    <div class="form-actions">
+      <button class="btn btn-p" onclick="doCopy('${pid}','${oid}')">Copia</button>
+      <button class="btn btn-g" onclick="closeModal()">Annulla</button>
+    </div>`);
+  setTimeout(()=>document.getElementById('cp-pwd')?.focus(),100);
+}
+
+async function doCopy(pid, oid) {
+  const value = document.getElementById('cp-pwd')?.value||'';
+  if(!value){toast('Inserisci la password','err');return}
+  try{
+    const r = await api(`/api/orgs/${oid}/docs/passwords/reveal/${pid}`,{method:'POST',body:JSON.stringify({method:'password',value})});
+    if(!r.ok){toast(r.error||'Password non corretta','err');return}
+    await navigator.clipboard.writeText(r.password);
+    closeModal();
+    toast('Password copiata negli appunti! (30s)');
+    setTimeout(()=>navigator.clipboard.writeText(''),30000);
+  }catch(e){toast('Copia fallita','err');}
+}
+
+function openNewPassword() {
+  showModal('🔑 Nuova Password', `
+    <div class="form-row"><label class="form-label">Titolo / Servizio *</label><input class="form-input" id="fp-title" placeholder="es. Router sede Milano"></div>
+    <div class="igrid">
+      <div class="form-row"><label class="form-label">Username / Email</label><input class="form-input" id="fp-user" placeholder="admin@esempio.it"></div>
+      <div class="form-row"><label class="form-label">URL</label><input class="form-input" id="fp-url" placeholder="https://..."></div>
+    </div>
+    <div class="form-row">
+      <label class="form-label">Password *</label>
+      <div style="display:flex;gap:8px">
+        <div style="position:relative;flex:1">
+          <input class="form-input" id="fp-pwd" type="password" placeholder="Inserisci la password" style="padding-right:40px">
+          <button onclick="togglePwdVisibility('fp-pwd')" style="position:absolute;right:10px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--text2);cursor:pointer;font-size:16px">👁</button>
+        </div>
+        <button class="btn btn-g" style="white-space:nowrap" onclick="generatePwd()">⚙ Genera</button>
+      </div>
+    </div>
+    <div id="pwd-strength" style="height:4px;border-radius:4px;background:var(--bg4);margin:-8px 0 12px;overflow:hidden"><div id="pwd-strength-bar" style="height:100%;width:0;border-radius:4px;transition:all .3s"></div></div>
+    <div class="form-row"><label class="form-label">Note</label><textarea class="note-area" id="fp-notes" rows="2" placeholder="Note aggiuntive..."></textarea></div>
+    <div class="form-actions">
+      <button class="btn btn-p" onclick="savePassword()">Salva</button>
+      <button class="btn btn-g" onclick="closeModal()">Annulla</button>
+    </div>`);
+  setTimeout(()=>{
+    document.getElementById('fp-pwd')?.addEventListener('input', updatePwdStrength);
+  },100);
+}
+
+function togglePwdVisibility(id) {
+  const inp = document.getElementById(id);
+  if(inp) inp.type = inp.type==='password'?'text':'password';
+}
+
+function generatePwd() {
+  const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()_+-=';
+  let pwd = '';
+  for(let i=0;i<20;i++) pwd += chars[Math.floor(Math.random()*chars.length)];
+  const inp = document.getElementById('fp-pwd');
+  if(inp){inp.value=pwd;inp.type='text';updatePwdStrength();}
+  toast('Password generata!');
+}
+
+function updatePwdStrength() {
+  const pwd = document.getElementById('fp-pwd')?.value||'';
+  const bar = document.getElementById('pwd-strength-bar');
+  if(!bar) return;
+  let score = 0;
+  if(pwd.length>=8) score++;
+  if(pwd.length>=14) score++;
+  if(/[A-Z]/.test(pwd)) score++;
+  if(/[0-9]/.test(pwd)) score++;
+  if(/[^A-Za-z0-9]/.test(pwd)) score++;
+  const colors = ['','var(--red)','var(--orange)','var(--orange)','var(--accent2)','var(--green)'];
+  bar.style.width = (score*20)+'%';
+  bar.style.background = colors[score]||'var(--red)';
+}
+
+async function savePassword() {
+  const title = document.getElementById('fp-title')?.value.trim();
+  const pwd   = document.getElementById('fp-pwd')?.value;
+  if(!title){toast('Inserisci il titolo','err');return}
+  if(!pwd){toast('Inserisci la password','err');return}
+  const body = {
+    title, password: pwd,
+    username: document.getElementById('fp-user')?.value||'',
+    url:      document.getElementById('fp-url')?.value||'',
+    notes:    document.getElementById('fp-notes')?.value||''
+  };
+  await api(`/api/orgs/${currentDocOrg}/docs/passwords`,{method:'POST',body:JSON.stringify(body)});
+  closeModal(); toast('Password salvata!');
+  await loadPasswords(currentDocOrg); renderDocContent();
+}
+
+function openEditPassword(pid) {
+  const p = docPasswords.find(x=>x.id===pid); if(!p) return;
+  showModal(`✏ Modifica — ${p.title}`, `
+    <div class="form-row"><label class="form-label">Titolo *</label><input class="form-input" id="fp-title" value="${esc(p.title)}"></div>
+    <div class="igrid">
+      <div class="form-row"><label class="form-label">Username</label><input class="form-input" id="fp-user" value="${esc(p.username||'')}"></div>
+      <div class="form-row"><label class="form-label">URL</label><input class="form-input" id="fp-url" value="${esc(p.url||'')}"></div>
+    </div>
+    <div class="form-row">
+      <label class="form-label">Nuova password (lascia vuoto per non cambiare)</label>
+      <div style="position:relative">
+        <input class="form-input" id="fp-pwd" type="password" placeholder="••••••••" style="padding-right:40px">
+        <button onclick="togglePwdVisibility('fp-pwd')" style="position:absolute;right:10px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--text2);cursor:pointer;font-size:16px">👁</button>
+      </div>
+    </div>
+    <div class="form-row"><label class="form-label">Note</label><textarea class="note-area" id="fp-notes" rows="2">${esc(p.notes||'')}</textarea></div>
+    <div class="form-actions">
+      <button class="btn btn-p" onclick="updatePassword('${pid}')">Salva</button>
+      <button class="btn btn-g" onclick="closeModal()">Annulla</button>
+    </div>`);
+}
+
+async function updatePassword(pid) {
+  const body = {
+    title:    document.getElementById('fp-title')?.value.trim(),
+    username: document.getElementById('fp-user')?.value||'',
+    url:      document.getElementById('fp-url')?.value||'',
+    notes:    document.getElementById('fp-notes')?.value||''
+  };
+  const pwd = document.getElementById('fp-pwd')?.value;
+  if(pwd) body.password = pwd;
+  await api(`/api/orgs/${currentDocOrg}/docs/passwords/${pid}`,{method:'PATCH',body:JSON.stringify(body)});
+  closeModal(); toast('Aggiornata!');
+  await loadPasswords(currentDocOrg); renderDocContent();
+}
+
+async function deletePassword(pid) {
+  if(!confirm('Eliminare questa password? L\'operazione è irreversibile.')) return;
+  await api(`/api/orgs/${currentDocOrg}/docs/passwords/${pid}`,{method:'DELETE'});
+  toast('Password eliminata'); docPasswords=docPasswords.filter(p=>p.id!==pid); renderDocContent();
 }
 
 // ── INIT ──────────────────────────────────────────────────────
