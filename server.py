@@ -10,9 +10,17 @@ from functools import wraps
 import urllib.parse
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "uptime-rmm-secret-key-2025")
-CORS(app)
-API_KEY = os.environ.get("UPTIME_API_KEY", "uptime-sos-2025")
+_secret = os.environ.get("SECRET_KEY")
+if not _secret:
+    raise RuntimeError("Variabile d'ambiente SECRET_KEY non impostata. Impostala su Render prima di avviare.")
+app.secret_key = _secret
+
+_dashboard_origin = os.environ.get("DASHBOARD_ORIGIN", "https://uptime-dashboard-qj2z.onrender.com")
+CORS(app, origins=[_dashboard_origin])
+
+API_KEY = os.environ.get("UPTIME_API_KEY")
+if not API_KEY:
+    raise RuntimeError("Variabile d'ambiente UPTIME_API_KEY non impostata. Impostala su Render prima di avviare.")
 
 DB_PATH = os.environ.get("DB_PATH", "dashboard.db")
 _lock = threading.Lock()
@@ -144,7 +152,9 @@ def init_db():
             command TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'pending',
             created_at TEXT NOT NULL,
-            executed_at TEXT
+            executed_at TEXT,
+            token TEXT,
+            token_expires_at TEXT
         );
         """)
         if not db.execute("SELECT 1 FROM users LIMIT 1").fetchone():
@@ -647,11 +657,16 @@ def send_command(mid):
     if cmd not in ("reboot", "rustdesk"):
         return jsonify({"error": "Comando non valido"}), 400
     now = _now()
+    token = None
+    expires_at = None
+    if cmd == "rustdesk":
+        token = secrets.token_urlsafe(32)
+        expires_at = (datetime.now() + timedelta(minutes=5)).isoformat()
     with _lock:
         with get_db() as db:
             db.execute(
-                "INSERT INTO commands (machine_id, command, status, created_at) VALUES (?,?,?,?)",
-                (mid, cmd, "pending", now))
+                "INSERT INTO commands (machine_id, command, status, created_at, token, token_expires_at) VALUES (?,?,?,?,?,?)",
+                (mid, cmd, "pending", now, token, expires_at))
             db.commit()
     return jsonify({"ok": True, "command": cmd})
 
@@ -665,7 +680,33 @@ def poll_commands(mid):
             (mid,)).fetchone())
     if not row:
         return jsonify({"command": None})
-    return jsonify({"command": row["command"], "id": row["id"]})
+    return jsonify({"command": row["command"], "id": row["id"], "token": row["token"]})
+
+@app.route("/api/machines/<mid>/validate_token", methods=["POST"])
+@require_api_key
+def validate_token(mid):
+    """Agent valida il token ricevuto prima di autorizzare la connessione RustDesk."""
+    data = request.json or {}
+    token = data.get("token", "").strip()
+    cid   = data.get("id")
+    if not token or not cid:
+        return jsonify({"valid": False, "error": "parametri mancanti"}), 400
+    now = datetime.now().isoformat()
+    with _lock:
+        with get_db() as db:
+            row = _row(db.execute(
+                "SELECT * FROM commands WHERE id=? AND machine_id=? AND token=? AND status='pending'",
+                (cid, mid, token)).fetchone())
+            if not row:
+                return jsonify({"valid": False, "error": "token non valido o già usato"}), 403
+            if row["token_expires_at"] and now > row["token_expires_at"]:
+                db.execute("UPDATE commands SET status='expired' WHERE id=?", (cid,))
+                db.commit()
+                return jsonify({"valid": False, "error": "token scaduto"}), 403
+            # Marca il token come in uso per prevenire replay
+            db.execute("UPDATE commands SET status='validating' WHERE id=?", (cid,))
+            db.commit()
+    return jsonify({"valid": True})
 
 @app.route("/api/machines/<mid>/ack", methods=["POST"])
 @require_api_key
@@ -2562,6 +2603,18 @@ def dashboard():
     return Response(DASHBOARD_HTML, mimetype="text/html")
 
 init_db()
+
+def _migrate_db():
+    """Aggiunge colonne mancanti per DB già esistenti."""
+    with get_db() as db:
+        for col, typ in [("token", "TEXT"), ("token_expires_at", "TEXT")]:
+            try:
+                db.execute(f"ALTER TABLE commands ADD COLUMN {col} {typ}")
+                db.commit()
+            except Exception:
+                pass  # colonna già presente
+
+_migrate_db()
 
 if __name__ == "__main__":
     print("Uptime Service Dashboard v4 — SQLite — http://localhost:5000")
