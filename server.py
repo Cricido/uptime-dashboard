@@ -138,6 +138,14 @@ def init_db():
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS commands (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            machine_id TEXT NOT NULL,
+            command TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL,
+            executed_at TEXT
+        );
         """)
         if not db.execute("SELECT 1 FROM users LIMIT 1").fetchone():
             uid = _new_uid()
@@ -627,6 +635,54 @@ def heartbeat():
             _upsert_machine(db, mid, pc, domain, data, now)
             db.commit()
     return jsonify({"ok":True})
+
+# ── Comandi remoti ───────────────────────────────────────────────────────────
+
+@app.route("/api/machines/<mid>/command", methods=["POST"])
+@require_login
+def send_command(mid):
+    """Dashboard invia un comando a una macchina (reboot, rustdesk)."""
+    data = request.json or {}
+    cmd = data.get("command", "").strip()
+    if cmd not in ("reboot", "rustdesk"):
+        return jsonify({"error": "Comando non valido"}), 400
+    now = _now()
+    with _lock:
+        with get_db() as db:
+            db.execute(
+                "INSERT INTO commands (machine_id, command, status, created_at) VALUES (?,?,?,?)",
+                (mid, cmd, "pending", now))
+            db.commit()
+    return jsonify({"ok": True, "command": cmd})
+
+@app.route("/api/machines/<mid>/poll", methods=["GET"])
+@require_api_key
+def poll_commands(mid):
+    """Client chiede se ci sono comandi in attesa."""
+    with get_db() as db:
+        row = _row(db.execute(
+            "SELECT * FROM commands WHERE machine_id=? AND status='pending' ORDER BY id LIMIT 1",
+            (mid,)).fetchone())
+    if not row:
+        return jsonify({"command": None})
+    return jsonify({"command": row["command"], "id": row["id"]})
+
+@app.route("/api/machines/<mid>/ack", methods=["POST"])
+@require_api_key
+def ack_command(mid):
+    """Client conferma l'esecuzione del comando."""
+    data = request.json or {}
+    cid = data.get("id")
+    if not cid:
+        return jsonify({"error": "id mancante"}), 400
+    now = _now()
+    with _lock:
+        with get_db() as db:
+            db.execute(
+                "UPDATE commands SET status='done', executed_at=? WHERE id=? AND machine_id=?",
+                (now, cid, mid))
+            db.commit()
+    return jsonify({"ok": True})
 
 @app.route("/api/machines")
 @require_api_key
@@ -1360,7 +1416,7 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
       <div class="panel">
         <table class="dev-table">
           <thead><tr>
-            <th>Device</th><th>Organizzazione</th><th>Sede</th><th>Reparto</th><th>Risorse</th><th>RustDesk</th>
+            <th>Device</th><th>Organizzazione</th><th>Sede</th><th>Reparto</th><th>Risorse</th><th>RustDesk</th><th>Comandi</th>
           </tr></thead>
           <tbody id="dev-tbody"></tbody>
         </table>
@@ -1776,7 +1832,7 @@ function showOrgDetail(oid, sid=null, did=null){
         <button class="btn btn-b" onclick="openAssignModal('${oid}')">+ Assegna Device</button>
       </div>
       <table class="dev-table"><thead><tr>
-        <th>Device</th><th>Sede</th><th>Reparto</th><th>Risorse</th><th>RustDesk</th><th></th>
+        <th>Device</th><th>Sede</th><th>Reparto</th><th>Risorse</th><th>RustDesk</th><th>Comandi</th><th></th>
       </tr></thead><tbody>
       ${filteredMachines.length?filteredMachines.map(m=>devRow(m,true)).join(''):`<tr><td colspan="6"><div class="empty"><div class="empty-icon">◉</div>Nessun device assegnato</div></td></tr>`}
       </tbody></table>
@@ -1790,7 +1846,7 @@ function devRow(m, inOrg=false){
   const org=allOrgs.find(o=>o.id===m.oid);
   const site=allSites.find(s=>s.id===m.sid);
   const dept=allDepts.find(d=>d.id===m.did);
-  return`<tr>
+  return`<tr style="cursor:pointer" onclick="openDeviceModal('${m.id}')" onmouseover="this.style.background='var(--bg3)'" onmouseout="this.style.background=''">
     <td><span class="dev-status ${m.status==='online'?'son':'sof'}"></span>
       <span class="dev-name">${m.pc_name}</span><br>
       <span class="dev-user">${m.user} · ${m.ip}</span>
@@ -1806,6 +1862,12 @@ function devRow(m, inOrg=false){
       </div>
     </td>
     <td>${m.rustdesk_id?`<button class="btn btn-p" style="font-size:10px;padding:4px 9px" onclick="connectRD('${m.rustdesk_id}')">⬡ ${m.rustdesk_id}</button>`:`<span style="font-size:10px;color:var(--text3)">N/D</span>`}</td>
+    <td>
+      <div style="display:flex;gap:4px;flex-wrap:wrap">
+        <button class="btn btn-b" style="font-size:10px;padding:4px 8px" onclick="sendCommand('${m.id}','rustdesk')" title="Avvia RustDesk sul client">⬡ RustDesk</button>
+        <button class="btn btn-d" style="font-size:10px;padding:4px 8px" onclick="sendCommand('${m.id}','reboot')" title="Riavvia il PC">↺ Riavvia</button>
+      </div>
+    </td>
     ${inOrg?`<td><button class="btn btn-g" style="font-size:10px;padding:4px 9px" onclick="openAssignDevice('${m.id}')">✏ Sposta</button></td>`:''}
   </tr>`;
 }
@@ -1917,6 +1979,62 @@ async function openTicket(id){
 async function updTicket(id,f,v){await api(`/api/ticket/${id}`,{method:'PATCH',body:JSON.stringify({[f]:v})});closeModal();toast('Ticket aggiornato');refreshAll()}
 async function saveNote(id){await api(`/api/ticket/${id}`,{method:'PATCH',body:JSON.stringify({note:document.getElementById('note-inp').value})});toast('Note salvate')}
 function connectRD(id){window.open(`rustdesk://${id}`,'_blank');toast(`Connessione RustDesk → ${id}`)}
+function openDeviceModal(mid){
+  const m=allMachines.find(x=>x.id===mid);
+  if(!m)return;
+  const org=allOrgs.find(o=>o.id===m.oid);
+  const site=allSites.find(s=>s.id===m.sid);
+  const dept=allDepts.find(d=>d.id===m.did);
+  const online=m.status==='online';
+  const statusBadge=online
+    ?'<span style="background:#1a3a2a;color:#2ebd6b;border:1px solid #2ebd6b44;border-radius:20px;padding:2px 10px;font-size:10px;font-family:monospace">&#9679; ONLINE</span>'
+    :'<span style="background:#2a1a1a;color:#e05c5c;border:1px solid #e05c5c44;border-radius:20px;padding:2px 10px;font-size:10px;font-family:monospace">&#9679; OFFLINE</span>';
+  const bar=v=>`<div style="display:flex;align-items:center;gap:8px"><div style="flex:1;height:5px;background:var(--bg0);border-radius:3px"><div style="width:${v}%;height:100%;border-radius:3px;background:${v>=85?'#e05c5c':v>=60?'#f0a500':'#2ebd6b'}"></div></div><span style="font-size:11px;color:var(--text2);font-family:monospace;width:32px">${v}%</span></div>`;
+  const ago=t=>{const d=Date.now()-new Date(t);const mn=Math.floor(d/60000);if(mn<1)return'Adesso';if(mn<60)return mn+'m fa';const h=Math.floor(mn/60);if(h<24)return h+'h fa';return Math.floor(h/24)+'g fa';};
+  const dis=online?'':'disabled title="Device offline"';
+  const rdBox=m.rustdesk_id
+    ?`<div class="rdbox" style="margin-bottom:16px"><div><div style="font-size:9px;color:var(--text2);margin-bottom:3px;letter-spacing:1px">RUSTDESK ID</div><div class="rdid">${m.rustdesk_id}</div></div><button class="btn btn-p" onclick="connectRD('${m.rustdesk_id}')">&#11045; Connetti ora</button></div>`
+    :'';
+  showModal(`&#128187; ${m.pc_name}`,`
+    <div style="margin-bottom:16px">${statusBadge}</div>
+    <div class="igrid" style="margin-bottom:16px">
+      <div class="iitem"><div class="ilabel">Utente</div><div class="ivalue">${m.user||'&mdash;'}</div></div>
+      <div class="iitem"><div class="ilabel">Dominio</div><div class="ivalue">${m.domain||'&mdash;'}</div></div>
+      <div class="iitem"><div class="ilabel">IP</div><div class="ivalue">${m.ip||'&mdash;'}</div></div>
+      <div class="iitem"><div class="ilabel">Sistema</div><div class="ivalue">${m.os||'&mdash;'}</div></div>
+      <div class="iitem"><div class="ilabel">Org</div><div class="ivalue">${org?org.name:'Non assegnato'}</div></div>
+      <div class="iitem"><div class="ilabel">Sede</div><div class="ivalue">${site?site.name:'&mdash;'}</div></div>
+      <div class="iitem"><div class="ilabel">Reparto</div><div class="ivalue">${dept?dept.name:'&mdash;'}</div></div>
+      <div class="iitem"><div class="ilabel">Ultimo contatto</div><div class="ivalue">${ago(m.last_seen)}</div></div>
+    </div>
+    <div style="background:var(--bg3);border-radius:9px;padding:12px;margin-bottom:16px">
+      <div style="font-size:10px;color:var(--text2);letter-spacing:1px;text-transform:uppercase;font-family:monospace;margin-bottom:10px">Risorse</div>
+      <div style="display:flex;flex-direction:column;gap:7px">
+        <div style="display:flex;align-items:center;gap:10px"><span style="font-size:10px;color:var(--text3);font-family:monospace;width:32px">CPU</span>${bar(m.cpu)}</div>
+        <div style="display:flex;align-items:center;gap:10px"><span style="font-size:10px;color:var(--text3);font-family:monospace;width:32px">RAM</span>${bar(m.ram)}</div>
+        <div style="display:flex;align-items:center;gap:10px"><span style="font-size:10px;color:var(--text3);font-family:monospace;width:32px">DSK</span>${bar(m.disk)}</div>
+      </div>
+    </div>
+    ${rdBox}
+    <div style="font-size:10px;color:var(--text2);letter-spacing:1px;text-transform:uppercase;font-family:monospace;margin-bottom:10px">Comandi remoti</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px">
+      <button class="btn btn-b" onclick="sendCommand('${m.id}','rustdesk')" ${dis}>&#11045; Avvia RustDesk</button>
+      <button class="btn btn-d" onclick="sendCommand('${m.id}','reboot')" ${dis}>&#8634; Riavvia PC</button>
+    </div>
+    <div style="display:flex;gap:8px">
+      <button class="btn btn-g" onclick="closeModal()">Chiudi</button>
+    </div>`);
+}
+
+async function sendCommand(mid, cmd){
+  const labels={'reboot':'Riavvio','rustdesk':'Avvio RustDesk'};
+  if(cmd==='reboot'&&!confirm('Riavviare il PC remoto?'))return;
+  try{
+    const d=await api(`/api/machines/${mid}/command`,{method:'POST',body:JSON.stringify({command:cmd})});
+    if(d.ok)toast(`✓ Comando '${labels[cmd]}' inviato — il client lo eseguirà entro 30s`);
+    else toast(`✗ Errore: ${d.error||'sconosciuto'}`);
+  }catch(e){toast('✗ Errore di rete')}
+}
 
 function showView(name,el){
   document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));
