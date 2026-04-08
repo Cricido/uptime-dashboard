@@ -85,7 +85,9 @@ def init_db():
             disk INTEGER DEFAULT 0,
             oid TEXT,
             sid TEXT,
-            did TEXT
+            did TEXT,
+            rd_temp_pwd TEXT DEFAULT '',
+            rd_tmp_expires TEXT DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS tickets (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -711,9 +713,10 @@ def validate_token(mid):
 @app.route("/api/machines/<mid>/ack", methods=["POST"])
 @require_api_key
 def ack_command(mid):
-    """Client conferma l'esecuzione del comando."""
+    """Client conferma l'esecuzione del comando. Per rustdesk invia anche la password temporanea."""
     data = request.json or {}
-    cid = data.get("id")
+    cid         = data.get("id")
+    rd_password = data.get("rd_password", "").strip()
     if not cid:
         return jsonify({"error": "id mancante"}), 400
     now = _now()
@@ -722,8 +725,33 @@ def ack_command(mid):
             db.execute(
                 "UPDATE commands SET status='done', executed_at=? WHERE id=? AND machine_id=?",
                 (now, cid, mid))
+            if rd_password:
+                expires = (datetime.now() + timedelta(minutes=5)).isoformat()
+                db.execute(
+                    "UPDATE machines SET rd_temp_pwd=?, rd_tmp_expires=? WHERE id=?",
+                    (rd_password, expires, mid))
             db.commit()
     return jsonify({"ok": True})
+
+@app.route("/api/machines/<mid>/rd_session", methods=["GET"])
+@require_login
+def rd_session(mid):
+    """Dashboard polling: restituisce ID e password temporanea RustDesk se ancora valida."""
+    now = datetime.now().isoformat()
+    with get_db() as db:
+        row = _row(db.execute(
+            "SELECT rustdesk_id, rd_temp_pwd, rd_tmp_expires FROM machines WHERE id=?",
+            (mid,)).fetchone())
+    if not row or not row.get("rd_temp_pwd"):
+        return jsonify({"ready": False})
+    if row["rd_tmp_expires"] and now > row["rd_tmp_expires"]:
+        return jsonify({"ready": False, "expired": True})
+    return jsonify({
+        "ready":      True,
+        "rd_id":      row["rustdesk_id"],
+        "rd_pwd":     row["rd_temp_pwd"],
+        "expires_at": row["rd_tmp_expires"]
+    })
 
 @app.route("/api/machines")
 @require_api_key
@@ -2068,13 +2096,45 @@ function openDeviceModal(mid){
 }
 
 async function sendCommand(mid, cmd){
-  const labels={'reboot':'Riavvio','rustdesk':'Avvio RustDesk'};
   if(cmd==='reboot'&&!confirm('Riavviare il PC remoto?'))return;
   try{
     const d=await api(`/api/machines/${mid}/command`,{method:'POST',body:JSON.stringify({command:cmd})});
-    if(d.ok)toast(`✓ Comando '${labels[cmd]}' inviato — il client lo eseguirà entro 30s`);
-    else toast(`✗ Errore: ${d.error||'sconosciuto'}`);
+    if(!d.ok){toast(`✗ Errore: ${d.error||'sconosciuto'}`);return;}
+    if(cmd==='rustdesk'){
+      toast('⏳ Comando inviato — attendo il client...');
+      await pollRDSession(mid);
+    } else {
+      toast('✓ Riavvio inviato — il client si riavvierà entro 30s');
+    }
   }catch(e){toast('✗ Errore di rete')}
+}
+
+async function pollRDSession(mid){
+  for(let i=0;i<20;i++){
+    await new Promise(r=>setTimeout(r,3000));
+    try{
+      const s=await api(`/api/machines/${mid}/rd_session`);
+      if(s.ready){showRDModal(s.rd_id,s.rd_pwd,s.expires_at);return;}
+      if(s.expired){toast('✗ Token scaduto — riprova');return;}
+    }catch(e){}
+  }
+  toast('✗ Timeout — il client non ha risposto entro 60s');
+}
+
+function showRDModal(rdId,rdPwd,expiresAt){
+  const exp=new Date(expiresAt).toLocaleTimeString();
+  showModal('⬡ Connessione RustDesk',`
+    <div style="text-align:center;padding:10px 0">
+      <div style="font-size:11px;color:var(--text2);margin-bottom:6px;letter-spacing:1px;text-transform:uppercase">ID Dispositivo</div>
+      <div style="font-size:30px;font-weight:bold;color:var(--accent);letter-spacing:5px;margin-bottom:20px">${rdId}</div>
+      <div style="font-size:11px;color:var(--text2);margin-bottom:6px;letter-spacing:1px;text-transform:uppercase">Password Temporanea</div>
+      <div style="font-size:30px;font-weight:bold;color:#f0a500;letter-spacing:5px;margin-bottom:6px">${rdPwd}</div>
+      <div style="font-size:11px;color:var(--text3);margin-bottom:20px">⏱ Scade alle ${exp}</div>
+      <div style="display:flex;gap:8px;justify-content:center">
+        <button class="btn btn-p" onclick="window.open('rustdesk://${rdId}','_blank')">⬡ Apri RustDesk</button>
+        <button class="btn btn-g" onclick="closeModal()">Chiudi</button>
+      </div>
+    </div>`);
 }
 
 function showView(name,el){
@@ -2607,9 +2667,14 @@ init_db()
 def _migrate_db():
     """Aggiunge colonne mancanti per DB già esistenti."""
     with get_db() as db:
-        for col, typ in [("token", "TEXT"), ("token_expires_at", "TEXT")]:
+        for tbl, col, typ in [
+            ("commands", "token",          "TEXT"),
+            ("commands", "token_expires_at","TEXT"),
+            ("machines", "rd_temp_pwd",    "TEXT DEFAULT ''"),
+            ("machines", "rd_tmp_expires", "TEXT DEFAULT ''"),
+        ]:
             try:
-                db.execute(f"ALTER TABLE commands ADD COLUMN {col} {typ}")
+                db.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {typ}")
                 db.commit()
             except Exception:
                 pass  # colonna già presente
