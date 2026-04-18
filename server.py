@@ -5,9 +5,28 @@ Flask + SQLite — Auth multi-utente + 2FA TOTP + persistenza completa
 from flask import Flask, request, jsonify, abort, Response, redirect
 from flask_cors import CORS
 import os, hashlib, threading, secrets, base64, time, hmac, struct, sqlite3
+from hashlib import pbkdf2_hmac
 from datetime import datetime, timedelta
 from functools import wraps
 import urllib.parse
+import json as _json
+import queue as _queue
+try:
+    from webauthn import (
+        generate_registration_options, verify_registration_response,
+        generate_authentication_options, verify_authentication_response,
+        options_to_json,
+    )
+    from webauthn.helpers.structs import (
+        AuthenticatorSelectionCriteria, UserVerificationRequirement,
+        ResidentKeyRequirement, PublicKeyCredentialDescriptor,
+        RegistrationCredential, AuthenticatorAttestationResponse,
+        AuthenticationCredential, AuthenticatorAssertionResponse,
+    )
+    from webauthn.helpers import bytes_to_base64url, base64url_to_bytes
+    _WEBAUTHN_OK = True
+except ImportError:
+    _WEBAUTHN_OK = False
 
 app = Flask(__name__)
 _secret = os.environ.get("SECRET_KEY")
@@ -15,14 +34,20 @@ if not _secret:
     raise RuntimeError("Variabile d'ambiente SECRET_KEY non impostata. Impostala su Render prima di avviare.")
 app.secret_key = _secret
 
-_dashboard_origin = os.environ.get("DASHBOARD_ORIGIN", "https://uptime-dashboard-qj2z.onrender.com")
+_dashboard_origin = os.environ.get("DASHBOARD_ORIGIN", "https://rmm.uptimeservice.it")
 CORS(app, origins=[_dashboard_origin])
+
+_rp_id   = urllib.parse.urlparse(_dashboard_origin).hostname or "localhost"
+_rp_name = "Uptime RMM"
+
 
 API_KEY = os.environ.get("UPTIME_API_KEY")
 if not API_KEY:
     raise RuntimeError("Variabile d'ambiente UPTIME_API_KEY non impostata. Impostala su Render prima di avviare.")
 
-DB_PATH = os.environ.get("DB_PATH", "dashboard.db")
+DB_PATH = os.environ.get("DB_PATH", "/var/data/dashboard.db")
+AGENT_PATH     = os.path.join(os.path.dirname(DB_PATH), "SOSHelpDesk.exe")
+AGENT_MSI_PATH = os.path.join(os.path.dirname(DB_PATH), "SOSHelpDesk.msi")
 _lock = threading.Lock()
 
 # ── Database ──────────────────────────────────────────────────
@@ -42,7 +67,8 @@ def init_db():
             role TEXT NOT NULL DEFAULT 'viewer',
             totp_secret TEXT NOT NULL,
             totp_enabled INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            disabled INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS sessions (
             token TEXT PRIMARY KEY,
@@ -87,7 +113,8 @@ def init_db():
             sid TEXT,
             did TEXT,
             rd_temp_pwd TEXT DEFAULT '',
-            rd_tmp_expires TEXT DEFAULT ''
+            rd_tmp_expires TEXT DEFAULT '',
+            blocked INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS tickets (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -102,7 +129,12 @@ def init_db():
             priority TEXT DEFAULT 'normal',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
-            note TEXT DEFAULT ''
+            note TEXT DEFAULT '',
+            oggetto TEXT DEFAULT '',
+            org_id TEXT DEFAULT '',
+            assigned_to TEXT DEFAULT '',
+            type TEXT DEFAULT 'Incidente',
+            origin TEXT DEFAULT 'Agent'
         );
         CREATE TABLE IF NOT EXISTS doc_apps (
             id TEXT PRIMARY KEY,
@@ -148,6 +180,19 @@ def init_db():
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS doc_passwords (
+            id TEXT PRIMARY KEY,
+            oid TEXT NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            username TEXT DEFAULT '',
+            password TEXT DEFAULT '',
+            url TEXT DEFAULT '',
+            notes TEXT DEFAULT '',
+            archived INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS commands (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             machine_id TEXT NOT NULL,
@@ -158,12 +203,145 @@ def init_db():
             token TEXT,
             token_expires_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS passkeys (
+            id TEXT PRIMARY KEY,
+            uid TEXT NOT NULL,
+            credential_id TEXT NOT NULL UNIQUE,
+            public_key TEXT NOT NULL,
+            sign_count INTEGER NOT NULL DEFAULT 0,
+            name TEXT DEFAULT 'Passkey',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS pk_challenges (
+            key TEXT PRIMARY KEY,
+            challenge BLOB NOT NULL,
+            uid TEXT,
+            exp REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS agent_config (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
         """)
+        # migrazione: aggiunge colonna disabled se non esiste
+        cols = [r[1] for r in db.execute("PRAGMA table_info(users)").fetchall()]
+        if "disabled" not in cols:
+            db.execute("ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0")
+        if "ticket_email" not in cols:
+            db.execute("ALTER TABLE users ADD COLUMN ticket_email TEXT DEFAULT ''")
+        t_cols = [r[1] for r in db.execute("PRAGMA table_info(tickets)").fetchall()]
+        if "rustdesk_pwd" not in t_cols:
+            db.execute("ALTER TABLE tickets ADD COLUMN rustdesk_pwd TEXT DEFAULT ''")
+        db.execute("""
+        CREATE TABLE IF NOT EXISTS invites (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            machine_id   TEXT NOT NULL,
+            pc_name      TEXT NOT NULL,
+            rustdesk_id  TEXT DEFAULT '',
+            rustdesk_pwd TEXT DEFAULT '',
+            created_at   TEXT NOT NULL,
+            expires_at   TEXT NOT NULL
+        )""")
+        inv_cols = [r[1] for r in db.execute("PRAGMA table_info(invites)").fetchall()]
+        if "expires_at" not in inv_cols:
+            db.execute("ALTER TABLE invites ADD COLUMN expires_at TEXT NOT NULL DEFAULT ''")
+            db.execute("UPDATE invites SET expires_at=datetime(created_at,'+1 hour') WHERE expires_at=''")
+        # tabella impostazioni globali (chiave/valore)
+        db.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL DEFAULT ''
+        )""")
+        # migrazione: aggiunge nuove colonne ai ticket
+        tcols = [r[1] for r in db.execute("PRAGMA table_info(tickets)").fetchall()]
+        for col, dflt in [("oggetto","''"),("org_id","''"),("assigned_to","''"),("type","'Incidente'"),("origin","'Agent'")]:
+            if col not in tcols:
+                db.execute(f"ALTER TABLE tickets ADD COLUMN {col} TEXT DEFAULT {dflt}")
+        # migrazione: aggiunge colonne blocked e agent_version alle machines
+        mcols = [r[1] for r in db.execute("PRAGMA table_info(machines)").fetchall()]
+        if "blocked" not in mcols:
+            db.execute("ALTER TABLE machines ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0")
+        if "agent_version" not in mcols:
+            db.execute("ALTER TABLE machines ADD COLUMN agent_version TEXT DEFAULT ''")
+        if "meta" not in mcols:
+            db.execute("ALTER TABLE machines ADD COLUMN meta TEXT DEFAULT ''")
+        if "device_type" not in mcols:
+            db.execute("ALTER TABLE machines ADD COLUMN device_type TEXT DEFAULT 'windows'")
+        # tabella backup configurazioni (pfSense e altri dispositivi)
+        db.execute("""
+        CREATE TABLE IF NOT EXISTS backups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            machine_id TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """)
+        db.executescript("""
+        CREATE TABLE IF NOT EXISTS download_tokens (
+            token      TEXT PRIMARY KEY,
+            label      TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT,
+            uses_left  INTEGER NOT NULL DEFAULT -1,
+            use_count  INTEGER NOT NULL DEFAULT 0
+        )""")
+        db.execute("""
+        CREATE TABLE IF NOT EXISTS chat_messages (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            machine_id TEXT NOT NULL,
+            direction  TEXT NOT NULL,
+            sender     TEXT NOT NULL DEFAULT '',
+            message    TEXT NOT NULL,
+            sent_at    TEXT NOT NULL,
+            read_at    TEXT
+        )""")
+        # migrazione: colonna sender in chat_messages
+        try:
+            _ccols = [r[1] for r in db.execute("PRAGMA table_info(chat_messages)").fetchall()]
+            if _ccols and "sender" not in _ccols:
+                db.execute("ALTER TABLE chat_messages ADD COLUMN sender TEXT NOT NULL DEFAULT ''")
+        except Exception:
+            pass
+        # tabella monitoring_events
+        db.executescript("""
+        CREATE TABLE IF NOT EXISTS monitoring_events (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            machine_id  TEXT NOT NULL,
+            type        TEXT NOT NULL DEFAULT 'heartbeat',
+            overall     TEXT NOT NULL DEFAULT 'ok',
+            payload     TEXT NOT NULL DEFAULT '{}',
+            created_at  TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_mon_machine ON monitoring_events(machine_id, created_at DESC);
+        """)
+        # migrazione: colonne monitoring su machines
+        try:
+            _mcols = [r[1] for r in db.execute("PRAGMA table_info(machines)").fetchall()]
+            if _mcols and "mon_status" not in _mcols:
+                db.execute("ALTER TABLE machines ADD COLUMN mon_status TEXT DEFAULT 'ok'")
+            if _mcols and "mon_updated_at" not in _mcols:
+                db.execute("ALTER TABLE machines ADD COLUMN mon_updated_at TEXT DEFAULT ''")
+            if _mcols and "mon_problems" not in _mcols:
+                db.execute("ALTER TABLE machines ADD COLUMN mon_problems TEXT DEFAULT '[]'")
+        except Exception:
+            pass
+        # migrazione: aggiunge colonna description a doc_passwords
+        try:
+            ppcols = [r[1] for r in db.execute("PRAGMA table_info(doc_passwords)").fetchall()]
+            if ppcols and "description" not in ppcols:
+                db.execute("ALTER TABLE doc_passwords ADD COLUMN description TEXT DEFAULT ''")
+        except Exception:
+            pass
+        # versione agent di default
+        if not db.execute("SELECT 1 FROM agent_config WHERE key='version'").fetchone():
+            db.execute("INSERT INTO agent_config VALUES ('version','1.0.1')")
         if not db.execute("SELECT 1 FROM users LIMIT 1").fetchone():
             uid = _new_uid()
             db.execute(
-                "INSERT INTO users VALUES (?,?,?,?,?,?,?)",
-                (uid, "admin", _hash("admin"), "admin", _totp_secret(), 0, _now())
+                "INSERT INTO users VALUES (?,?,?,?,?,?,?,?)",
+                (uid, "admin", _hash_secure("admin"), "admin", _totp_secret(), 0, _now(), 0)
             )
         db.commit()
 
@@ -179,7 +357,24 @@ def _new_uid():
 
 # ── Helpers ───────────────────────────────────────────────────
 def _now(): return datetime.now().isoformat()
+
+# Hash sicuro con PBKDF2 + salt: "pbkdf2$<salt_hex>$<dk_hex>"
+# Mantiene compatibilità con i vecchi hash SHA-256 (formato senza "$")
 def _hash(s): return hashlib.sha256(s.encode()).hexdigest()
+
+def _hash_secure(s):
+    salt = secrets.token_bytes(16)
+    dk = pbkdf2_hmac("sha256", s.encode(), salt, 200_000)
+    return f"pbkdf2${salt.hex()}${dk.hex()}"
+
+def _verify_password(stored, provided):
+    """Verifica password, supporta sia SHA-256 legacy che PBKDF2."""
+    if stored.startswith("pbkdf2$"):
+        _, salt_hex, dk_hex = stored.split("$")
+        dk = pbkdf2_hmac("sha256", provided.encode(), bytes.fromhex(salt_hex), 200_000)
+        return hmac.compare_digest(dk.hex(), dk_hex)
+    # Legacy SHA-256 senza salt
+    return hmac.compare_digest(stored, hashlib.sha256(provided.encode()).hexdigest())
 
 # ── TOTP (RFC 6238) ───────────────────────────────────────────
 def _totp_secret():
@@ -256,7 +451,7 @@ def require_login(f):
 def require_api_key(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        key = request.headers.get("X-API-Key") or request.args.get("api_key")
+        key = request.headers.get("X-API-Key")  # solo header, mai query string (finisce nei log)
         if key == API_KEY:
             return f(*args, **kwargs)
         u, s = _current_user()
@@ -270,10 +465,7 @@ def require_admin(f):
     def decorated(*args, **kwargs):
         u, s = _current_user()
         if not u or u.get("role") != "admin":
-            # controlla anche API key + admin
-            key = request.headers.get("X-API-Key") or request.args.get("api_key")
-            if key != API_KEY:
-                abort(403)
+            abort(403)
         return f(*args, **kwargs)
     return decorated
 
@@ -295,11 +487,19 @@ def do_login():
         user = _row(db.execute(
             "SELECT * FROM users WHERE LOWER(username)=?", (username,)
         ).fetchone())
-    if not user or user["password_hash"] != _hash(password):
+    if not user or not _verify_password(user["password_hash"], password):
         return jsonify({"ok": False, "error": "Credenziali non valide"}), 401
+    if user.get("disabled"):
+        return jsonify({"ok": False, "error": "Account disabilitato"}), 403
+    # Migrazione trasparente: se l'hash è legacy SHA-256, aggiorna a PBKDF2
+    if not user["password_hash"].startswith("pbkdf2$"):
+        with get_db() as db:
+            db.execute("UPDATE users SET password_hash=? WHERE id=?",
+                       (_hash_secure(password), user["id"]))
+            db.commit()
     token = _create_session(user["id"])
     resp = jsonify({"ok": True, "needs_2fa": bool(user["totp_enabled"]), "token": token})
-    resp.set_cookie("uptime_token", token, httponly=True, samesite="Lax", max_age=28800)
+    resp.set_cookie("uptime_token", token, httponly=True, secure=True, samesite="Lax", max_age=28800)
     return resp
 
 @app.route("/api/auth/verify2fa", methods=["POST"])
@@ -343,7 +543,7 @@ def auth_me():
 @require_admin
 def get_users():
     with get_db() as db:
-        rows = _rows(db.execute("SELECT id,username,role,totp_enabled,created_at FROM users").fetchall())
+        rows = _rows(db.execute("SELECT id,username,role,totp_enabled,created_at,disabled,ticket_email FROM users").fetchall())
     return jsonify(rows)
 
 @app.route("/api/users", methods=["POST"])
@@ -361,8 +561,8 @@ def create_user():
     try:
         with get_db() as db:
             db.execute(
-                "INSERT INTO users VALUES (?,?,?,?,?,?,?)",
-                (uid, username, _hash(password), role, ts, 0, _now())
+                "INSERT INTO users VALUES (?,?,?,?,?,?,?,?)",
+                (uid, username, _hash_secure(password), role, ts, 0, _now(), 0)
             )
             db.commit()
     except sqlite3.IntegrityError:
@@ -371,13 +571,23 @@ def create_user():
 
 @app.route("/api/users/<uid>", methods=["PATCH"])
 @require_api_key
-@require_admin
+@require_login
 def update_user(uid):
     d = request.json or {}
+    u, _ = _current_user()
+    if not u: abort(401)
+    is_admin = u["role"] == "admin"
+    is_self  = u["id"] == uid
+    if not is_admin and not is_self: abort(403)
     with get_db() as db:
         if not db.execute("SELECT 1 FROM users WHERE id=?", (uid,)).fetchone(): abort(404)
-        if "role"     in d: db.execute("UPDATE users SET role=? WHERE id=?", (d["role"], uid))
-        if "password" in d: db.execute("UPDATE users SET password_hash=? WHERE id=?", (_hash(d["password"]), uid))
+        # solo admin può cambiare ruolo e stato disabled
+        if is_admin:
+            if "role"     in d: db.execute("UPDATE users SET role=? WHERE id=?", (d["role"], uid))
+            if "disabled" in d: db.execute("UPDATE users SET disabled=? WHERE id=?", (1 if d["disabled"] else 0, uid))
+        # password e ticket_email: admin su tutti, utente solo su se stesso
+        if "password"     in d: db.execute("UPDATE users SET password_hash=? WHERE id=?", (_hash_secure(d["password"]), uid))
+        if "ticket_email" in d: db.execute("UPDATE users SET ticket_email=? WHERE id=?", (d["ticket_email"].strip(), uid))
         db.commit()
     return jsonify({"ok": True})
 
@@ -440,6 +650,184 @@ def totp_disable():
         if not db.execute("SELECT 1 FROM users WHERE id=?", (uid,)).fetchone(): abort(404)
         new_secret = _totp_secret()
         db.execute("UPDATE users SET totp_enabled=0, totp_secret=? WHERE id=?", (new_secret, uid))
+        db.commit()
+    return jsonify({"ok": True})
+
+# ── Passkey / WebAuthn ───────────────────────────────────────
+def _pk_store(key, challenge_bytes, uid=None, ttl=300):
+    exp = time.time() + ttl
+    with get_db() as db:
+        db.execute("DELETE FROM pk_challenges WHERE exp < ?", (time.time(),))
+        db.execute("INSERT OR REPLACE INTO pk_challenges VALUES (?,?,?,?)",
+                   (key, challenge_bytes, uid, exp))
+        db.commit()
+
+def _pk_pop(key):
+    with get_db() as db:
+        row = db.execute("SELECT challenge, uid, exp FROM pk_challenges WHERE key=?", (key,)).fetchone()
+        if not row:
+            return None
+        db.execute("DELETE FROM pk_challenges WHERE key=?", (key,))
+        db.commit()
+    if row["exp"] < time.time():
+        return None
+    return {"challenge": bytes(row["challenge"]), "uid": row["uid"]}
+
+@app.route("/api/auth/passkey/register/begin", methods=["POST"])
+@require_login
+def passkey_reg_begin():
+    if not _WEBAUTHN_OK:
+        return jsonify({"error": "py_webauthn non installato sul server"}), 501
+    u, _ = _current_user()
+    with get_db() as db:
+        creds = _rows(db.execute("SELECT credential_id FROM passkeys WHERE uid=?", (u["id"],)).fetchall())
+    exclude = [PublicKeyCredentialDescriptor(id=base64url_to_bytes(c["credential_id"])) for c in creds]
+    opts = generate_registration_options(
+        rp_id=_rp_id, rp_name=_rp_name,
+        user_id=u["id"].encode(),
+        user_name=u["username"], user_display_name=u["username"],
+        exclude_credentials=exclude,
+        authenticator_selection=AuthenticatorSelectionCriteria(
+            resident_key=ResidentKeyRequirement.PREFERRED,
+            user_verification=UserVerificationRequirement.PREFERRED,
+        ),
+    )
+    token = request.cookies.get("uptime_token") or secrets.token_hex(16)
+    _pk_store(f"reg:{token}", opts.challenge, uid=u["id"])
+    return jsonify(_json.loads(options_to_json(opts)))
+
+@app.route("/api/auth/passkey/register/finish", methods=["POST"])
+@require_login
+def passkey_reg_finish():
+    if not _WEBAUTHN_OK:
+        return jsonify({"error": "py_webauthn non installato sul server"}), 501
+    u, _ = _current_user()
+    token = request.cookies.get("uptime_token")
+    stored = _pk_pop(f"reg:{token}")
+    if not stored:
+        return jsonify({"ok": False, "error": "Challenge scaduto, riprova"}), 400
+    data = request.json or {}
+    name = data.pop("name", "Passkey")
+    try:
+        resp_data = data.get("response", {})
+        credential = RegistrationCredential(
+            id=data["id"],
+            raw_id=base64url_to_bytes(data["rawId"]),
+            response=AuthenticatorAttestationResponse(
+                client_data_json=base64url_to_bytes(resp_data["clientDataJSON"]),
+                attestation_object=base64url_to_bytes(resp_data["attestationObject"]),
+            ),
+            type=data.get("type", "public-key"),
+        )
+        verification = verify_registration_response(
+            credential=credential,
+            expected_challenge=stored["challenge"],
+            expected_rp_id=_rp_id,
+            expected_origin=_dashboard_origin,
+        )
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    cred_id = bytes_to_base64url(verification.credential_id)
+    pub_key = bytes_to_base64url(verification.credential_public_key)
+    with get_db() as db:
+        if db.execute("SELECT 1 FROM passkeys WHERE credential_id=?", (cred_id,)).fetchone():
+            return jsonify({"ok": False, "error": "Passkey già registrata"}), 409
+        db.execute("INSERT INTO passkeys VALUES (?,?,?,?,?,?,?)",
+                   (_new_uid(), u["id"], cred_id, pub_key, verification.sign_count, name, _now()))
+        db.commit()
+    return jsonify({"ok": True})
+
+@app.route("/api/auth/passkey/auth/begin", methods=["POST"])
+def passkey_auth_begin():
+    if not _WEBAUTHN_OK:
+        return jsonify({"error": "py_webauthn non installato sul server"}), 501
+    d = request.json or {}
+    username = d.get("username", "").strip().lower()
+    allow = []
+    with get_db() as db:
+        if username:
+            u = _row(db.execute("SELECT id FROM users WHERE LOWER(username)=?", (username,)).fetchone())
+            if u:
+                creds = _rows(db.execute("SELECT credential_id FROM passkeys WHERE uid=?", (u["id"],)).fetchall())
+                allow = [PublicKeyCredentialDescriptor(id=base64url_to_bytes(c["credential_id"])) for c in creds]
+    opts = generate_authentication_options(
+        rp_id=_rp_id,
+        allow_credentials=allow,
+        user_verification=UserVerificationRequirement.PREFERRED,
+    )
+    key = secrets.token_hex(16)
+    _pk_store(f"auth:{key}", opts.challenge)
+    return jsonify({**_json.loads(options_to_json(opts)), "_key": key})
+
+@app.route("/api/auth/passkey/auth/finish", methods=["POST"])
+def passkey_auth_finish():
+    if not _WEBAUTHN_OK:
+        return jsonify({"error": "py_webauthn non installato sul server"}), 501
+    data = request.json or {}
+    key = data.pop("_key", "")
+    stored = _pk_pop(f"auth:{key}")
+    if not stored:
+        return jsonify({"ok": False, "error": "Challenge scaduto, riprova"}), 400
+    cred_id_b64 = data.get("id", "")
+    with get_db() as db:
+        pk_row = _row(db.execute("SELECT * FROM passkeys WHERE credential_id=?", (cred_id_b64,)).fetchone())
+    if not pk_row:
+        return jsonify({"ok": False, "error": "Passkey non riconosciuta"}), 401
+    try:
+        resp_data = data.get("response", {})
+        user_handle = resp_data.get("userHandle")
+        credential = AuthenticationCredential(
+            id=data["id"],
+            raw_id=base64url_to_bytes(data["rawId"]),
+            response=AuthenticatorAssertionResponse(
+                client_data_json=base64url_to_bytes(resp_data["clientDataJSON"]),
+                authenticator_data=base64url_to_bytes(resp_data["authenticatorData"]),
+                signature=base64url_to_bytes(resp_data["signature"]),
+                user_handle=base64url_to_bytes(user_handle) if user_handle else None,
+            ),
+            type=data.get("type", "public-key"),
+        )
+        verification = verify_authentication_response(
+            credential=credential,
+            expected_challenge=stored["challenge"],
+            expected_rp_id=_rp_id,
+            expected_origin=_dashboard_origin,
+            credential_public_key=base64url_to_bytes(pk_row["public_key"]),
+            credential_current_sign_count=pk_row["sign_count"],
+        )
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 401
+    with get_db() as db:
+        db.execute("UPDATE passkeys SET sign_count=? WHERE credential_id=?",
+                   (verification.new_sign_count, cred_id_b64))
+        u = _row(db.execute("SELECT * FROM users WHERE id=?", (pk_row["uid"],)).fetchone())
+        db.commit()
+    if not u:
+        return jsonify({"ok": False, "error": "Utente non trovato"}), 401
+    token = _create_session(u["id"])
+    _set_totp_verified(token)  # passkey = autenticazione completa, niente 2FA aggiuntivo
+    resp = jsonify({"ok": True})
+    resp.set_cookie("uptime_token", token, httponly=True, secure=True, samesite="Lax", max_age=28800)
+    return resp
+
+@app.route("/api/auth/passkeys", methods=["GET"])
+@require_login
+def list_passkeys():
+    u, _ = _current_user()
+    with get_db() as db:
+        rows = _rows(db.execute(
+            "SELECT id, name, created_at FROM passkeys WHERE uid=? ORDER BY created_at DESC", (u["id"],)
+        ).fetchall())
+    return jsonify(rows)
+
+@app.route("/api/auth/passkeys/<pkid>", methods=["DELETE"])
+@require_login
+def delete_passkey(pkid):
+    u, _ = _current_user()
+    with get_db() as db:
+        if not db.execute("SELECT 1 FROM passkeys WHERE id=? AND uid=?", (pkid, u["id"])).fetchone():
+            abort(404)
+        db.execute("DELETE FROM passkeys WHERE id=? AND uid=?", (pkid, u["id"]))
         db.commit()
     return jsonify({"ok": True})
 
@@ -572,6 +960,399 @@ def delete_dept(did):
         db.commit()
     return jsonify({"ok":True})
 
+# ── Settings mail ────────────────────────────────────────────
+_MAIL_KEYS = ["smtp_host","smtp_port","smtp_user","smtp_password","smtp_from","smtp_ssl"]
+
+@app.route("/api/settings/mail", methods=["GET"])
+@require_login
+@require_admin
+def get_mail_settings():
+    with get_db() as db:
+        rows = db.execute("SELECT key,value FROM settings WHERE key LIKE 'smtp_%'").fetchall()
+    data = {r[0]: r[1] for r in rows}
+    data.pop("smtp_password", None)  # non inviare la password in chiaro
+    data["smtp_password_set"] = bool(rows and any(r[0]=="smtp_password" and r[1] for r in rows))
+    return jsonify(data)
+
+@app.route("/api/settings/mail", methods=["POST"])
+@require_login
+@require_admin
+def save_mail_settings():
+    d = request.json or {}
+    with get_db() as db:
+        for key in _MAIL_KEYS:
+            if key in d:
+                val = str(d[key]).strip()
+                if key == "smtp_password" and not val:
+                    continue  # password vuota = non aggiornare
+                db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, val))
+        db.commit()
+    return jsonify({"ok": True})
+
+@app.route("/api/settings/mail/test", methods=["POST"])
+@require_login
+@require_admin
+def test_mail():
+    import smtplib as _smtp_test
+    from email.mime.text import MIMEText as _MIMEText
+    d = request.json or {}
+    dest = d.get("to","").strip()
+    if not dest:
+        return jsonify({"ok": False, "error": "Indirizzo destinatario mancante"}), 400
+    with get_db() as db:
+        cfg = {r[0]: r[1] for r in db.execute("SELECT key,value FROM settings WHERE key LIKE 'smtp_%'").fetchall()}
+    host = cfg.get("smtp_host","")
+    port = int(cfg.get("smtp_port", 465))
+    user = cfg.get("smtp_user","")
+    pwd  = cfg.get("smtp_password","")
+    display = cfg.get("smtp_from","").strip()
+    frm_header = f"{display} <{user}>" if display else user
+    ssl  = cfg.get("smtp_ssl","1") not in ("0","false","False")
+    if not host or not user or not pwd:
+        return jsonify({"ok": False, "error": "Configurazione SMTP incompleta"}), 400
+    try:
+        msg = _MIMEText("<h2>Test email da Uptime RMM</h2><p>Configurazione SMTP funzionante.</p>", "html")
+        msg["From"] = frm_header; msg["To"] = dest; msg["Subject"] = "✅ Test email — Uptime RMM"
+        if ssl:
+            with _smtp_test.SMTP_SSL(host, port, timeout=10) as s:
+                s.login(user, pwd); s.sendmail(user, dest, msg.as_string())
+        else:
+            with _smtp_test.SMTP(host, port, timeout=10) as s:
+                s.starttls(); s.login(user, pwd); s.sendmail(user, dest, msg.as_string())
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+@app.route("/api/settings/mail/test-ticket", methods=["POST"])
+@require_login
+@require_admin
+def test_ticket_mail():
+    """Testa la notifica ticket inviando un'email di prova ai destinatari configurati."""
+    with get_db() as db:
+        cfg   = {r[0]: r[1] for r in db.execute("SELECT key,value FROM settings WHERE key LIKE 'smtp_%'").fetchall()}
+        dests = [r[0] for r in db.execute("SELECT ticket_email FROM users WHERE ticket_email != '' AND disabled=0").fetchall()]
+    if not cfg.get("smtp_host") or not cfg.get("smtp_user") or not cfg.get("smtp_password"):
+        return jsonify({"ok": False, "error": "Configurazione SMTP mancante"})
+    if not dests:
+        return jsonify({"ok": False, "error": "Nessun utente ha un'email ticket configurata in Gestione Utenti"})
+    fake_data = {"pc_name":"TEST-PC","user":"Test Utente","ip":"192.168.1.1",
+                 "subject":"[TEST] Notifica ticket","description":"Email di prova dalla dashboard.",
+                 "priority":"media","categoria":"Software","rustdesk_id":""}
+    subject, html = _build_ticket_email_html(0, fake_data)
+    err = _do_send_ticket_email(cfg, dests, subject, html)
+    if err:
+        return jsonify({"ok": False, "error": err, "destinatari": dests})
+    return jsonify({"ok": True, "destinatari": dests})
+
+# ── Agent update ─────────────────────────────────────────────
+@app.route("/api/agent/version", methods=["GET"])
+@require_api_key
+def agent_version():
+    with get_db() as db:
+        row = db.execute("SELECT value FROM agent_config WHERE key='version'").fetchone()
+    version = row[0] if row else "1.0.1"
+    sha256 = None
+    if os.path.exists(AGENT_PATH):
+        with open(AGENT_PATH, "rb") as f:
+            sha256 = hashlib.sha256(f.read()).hexdigest()
+    return jsonify({"version": version, "sha256": sha256})
+
+@app.route("/api/agent/info", methods=["GET"])
+@require_login
+def agent_info():
+    """Restituisce info diagnostiche sull'EXE caricato (per debug)."""
+    with get_db() as db:
+        row = db.execute("SELECT value FROM agent_config WHERE key='version'").fetchone()
+    version = row[0] if row else None
+    exists = os.path.exists(AGENT_PATH)
+    size = os.path.getsize(AGENT_PATH) if exists else 0
+    sha256 = None
+    if exists:
+        with open(AGENT_PATH, "rb") as f:
+            sha256 = hashlib.sha256(f.read()).hexdigest()
+    return jsonify({
+        "path": AGENT_PATH,
+        "exists": exists,
+        "size_bytes": size,
+        "size_mb": round(size / 1024 / 1024, 2),
+        "version_db": version,
+        "sha256": sha256,
+    })
+
+@app.route("/api/agent/download", methods=["GET"])
+@require_api_key
+def agent_download():
+    if not os.path.exists(AGENT_PATH):
+        return jsonify({"error": "Agent non disponibile"}), 404
+    with open(AGENT_PATH, "rb") as f:
+        content = f.read()
+    filename = os.path.basename(AGENT_PATH)
+    return Response(content, mimetype="application/octet-stream",
+                    headers={"Content-Disposition": f"attachment; filename={filename}"})
+
+# ── Download token API ────────────────────────────────────────────────────────
+
+@app.route("/api/download-tokens", methods=["GET"])
+@require_login
+def list_download_tokens():
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT token,label,created_by,created_at,expires_at,uses_left,use_count "
+            "FROM download_tokens ORDER BY created_at DESC"
+        ).fetchall()
+    return jsonify([dict(zip(
+        ["token","label","created_by","created_at","expires_at","uses_left","use_count"], r
+    )) for r in rows])
+
+@app.route("/api/download-tokens", methods=["POST"])
+@require_login
+def create_download_token():
+    import secrets, datetime
+    data = request.get_json(silent=True) or {}
+    label    = data.get("label", "").strip() or "Link installer"
+    uses     = int(data.get("uses", -1))      # -1 = illimitato
+    days     = int(data.get("days", 0))        # 0  = nessuna scadenza
+    u, _     = _current_user()
+    token    = secrets.token_urlsafe(12)       # ~16 char URL-safe
+    expires  = None
+    if days > 0:
+        expires = (datetime.datetime.utcnow() + datetime.timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    with get_db() as db:
+        db.execute(
+            "INSERT INTO download_tokens VALUES (?,?,?,?,?,?,0)",
+            (token, label, u["username"], _now(), expires, uses)
+        )
+        db.commit()
+    return jsonify({"token": token, "url": f"/download/{token}"})
+
+@app.route("/api/download-tokens/<token>", methods=["DELETE"])
+@require_login
+def delete_download_token(token):
+    with get_db() as db:
+        db.execute("DELETE FROM download_tokens WHERE token=?", (token,))
+        db.commit()
+    return jsonify({"ok": True})
+
+# ── Chat endpoints ────────────────────────────────────────────
+@app.route("/api/machines/<mid>/chat", methods=["GET"])
+@require_login
+def chat_history(mid):
+    """Restituisce lo storico messaggi della chat per una macchina."""
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT id, direction, sender, message, sent_at, read_at FROM chat_messages WHERE machine_id=? ORDER BY id",
+            (mid,)).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+@app.route("/api/machines/<mid>/chat", methods=["POST"])
+@require_login
+def chat_send(mid):
+    """Dashboard invia un messaggio all'agente."""
+    data = request.json or {}
+    msg = (data.get("message") or "").strip()
+    if not msg:
+        return jsonify({"error": "messaggio vuoto"}), 400
+    u, _ = _current_user()
+    sender = u.get("username", "Dashboard") if u else "Dashboard"
+    with get_db() as db:
+        cur = db.execute(
+            "INSERT INTO chat_messages (machine_id, direction, sender, message, sent_at, read_at) VALUES (?,?,?,?,?,NULL)",
+            (mid, "out", sender, msg, _now()))
+        db.commit()
+        new_id = cur.lastrowid
+    return jsonify({"ok": True, "id": new_id})
+
+@app.route("/api/machines/<mid>/chat/reply", methods=["POST"])
+@require_api_key
+def chat_reply(mid):
+    """Agente risponde alla dashboard."""
+    data = request.json or {}
+    msg    = (data.get("message") or "").strip()
+    sender = (data.get("sender")  or "Agente").strip()
+    if not msg:
+        return jsonify({"error": "messaggio vuoto"}), 400
+    with get_db() as db:
+        db.execute(
+            "INSERT INTO chat_messages (machine_id, direction, sender, message, sent_at, read_at) VALUES (?,?,?,?,?,?)",
+            (mid, "in", sender, msg, _now(), _now()))
+        db.commit()
+    return jsonify({"ok": True})
+
+@app.route("/api/machines/<mid>/chat/<int:msg_id>/read", methods=["POST"])
+@require_api_key
+def chat_mark_read(mid, msg_id):
+    """Agente segnala che ha ricevuto il messaggio."""
+    with get_db() as db:
+        db.execute(
+            "UPDATE chat_messages SET read_at=? WHERE id=? AND machine_id=? AND read_at IS NULL",
+            (_now(), msg_id, mid))
+        db.commit()
+    return jsonify({"ok": True})
+
+@app.route("/api/machines/<mid>/chat/pending", methods=["GET"])
+@require_api_key
+def chat_pending(mid):
+    """Fast-poll agente: restituisce il primo messaggio non letto."""
+    with get_db() as db:
+        row = _row(db.execute(
+            "SELECT id, sender, message FROM chat_messages "
+            "WHERE machine_id=? AND direction='out' AND read_at IS NULL "
+            "ORDER BY id LIMIT 1", (mid,)).fetchone())
+    if not row:
+        return jsonify({"pending": False})
+    return jsonify({"pending": True, "id": row["id"], "sender": row["sender"], "message": row["message"]})
+
+@app.route("/api/machines/<mid>/chat", methods=["DELETE"])
+@require_login
+def chat_delete(mid):
+    """Cancella lo storico chat di una macchina (solo admin)."""
+    u, _ = _current_user()
+    if not u or u.get("role") != "admin":
+        return jsonify({"error": "solo admin"}), 403
+    with get_db() as db:
+        db.execute("DELETE FROM chat_messages WHERE machine_id=?", (mid,))
+        db.commit()
+    return jsonify({"ok": True})
+
+@app.route("/download/<token>", methods=["GET", "HEAD"])
+def download_with_token(token):
+    import datetime
+    with get_db() as db:
+        row = db.execute(
+            "SELECT expires_at, uses_left, use_count FROM download_tokens WHERE token=?", (token,)
+        ).fetchone()
+    if not row:
+        return Response("Link non valido o scaduto.", status=404, mimetype="text/plain")
+    expires_at, uses_left, use_count = row
+    if expires_at:
+        exp = datetime.datetime.strptime(expires_at, "%Y-%m-%d %H:%M:%S")
+        if datetime.datetime.utcnow() > exp:
+            return Response("Link scaduto.", status=410, mimetype="text/plain")
+    if uses_left != -1 and use_count >= uses_left:
+        return Response("Link esaurito (numero massimo di download raggiunto).", status=410, mimetype="text/plain")
+    # Aggiorna contatore solo su GET
+    if request.method == "GET":
+        with get_db() as db:
+            db.execute("UPDATE download_tokens SET use_count=use_count+1 WHERE token=?", (token,))
+            db.commit()
+        # Servi MSI se disponibile, altrimenti EXE
+        if os.path.exists(AGENT_MSI_PATH):
+            with open(AGENT_MSI_PATH, "rb") as f:
+                content = f.read()
+            return Response(content, mimetype="application/octet-stream",
+                            headers={"Content-Disposition": "attachment; filename=SOSHelpDesk_Setup.msi"})
+        if os.path.exists(AGENT_PATH):
+            with open(AGENT_PATH, "rb") as f:
+                content = f.read()
+            return Response(content, mimetype="application/octet-stream",
+                            headers={"Content-Disposition": "attachment; filename=SOSHelpDesk.exe"})
+        return Response("Installer non ancora disponibile.", status=404, mimetype="text/plain")
+    return Response(status=200)  # HEAD ok
+
+@app.route("/download/agent", methods=["GET", "HEAD"])
+def download_agent_public():
+    """Endpoint pubblico (no login) per scaricare il MSI installer."""
+    if os.path.exists(AGENT_MSI_PATH):
+        with open(AGENT_MSI_PATH, "rb") as f:
+            content = f.read()
+        return Response(content, mimetype="application/octet-stream",
+                        headers={"Content-Disposition": "attachment; filename=SOSHelpDesk_Setup.msi"})
+    if os.path.exists(AGENT_PATH):
+        with open(AGENT_PATH, "rb") as f:
+            content = f.read()
+        return Response(content, mimetype="application/octet-stream",
+                        headers={"Content-Disposition": "attachment; filename=SOSHelpDesk.exe"})
+    return Response("Installer non disponibile. Contatta il supporto.", status=404, mimetype="text/plain")
+
+PFSENSE_AGENT_PATH = os.path.join(os.path.dirname(DB_PATH), "pfsense_agent.sh")
+
+@app.route("/api/agent/pfsense/download", methods=["GET"])
+@require_api_key
+def pfsense_agent_download():
+    """Scarica lo script agent per pfSense."""
+    if not os.path.exists(PFSENSE_AGENT_PATH):
+        return jsonify({"error": "Agent pfSense non disponibile sul server"}), 404
+    with open(PFSENSE_AGENT_PATH, "r", encoding="utf-8") as f:
+        content = f.read()
+    return Response(content, mimetype="text/plain",
+                    headers={"Content-Disposition": "attachment; filename=sos_agent.sh"})
+
+@app.route("/api/agent/pfsense/upload", methods=["POST"])
+@require_login
+@require_admin
+def pfsense_agent_upload():
+    """Carica una nuova versione dell'agent pfSense."""
+    f = request.files.get("file")
+    if not f:
+        return jsonify({"error": "File obbligatorio"}), 400
+    content = f.read()
+    with open(PFSENSE_AGENT_PATH, "wb") as out:
+        out.write(content)
+    return jsonify({"ok": True})
+
+@app.route("/api/agent/msi/upload", methods=["POST"])
+@require_login
+@require_admin
+def agent_msi_upload():
+    f = request.files.get("file")
+    if not f:
+        return jsonify({"error": "File obbligatorio"}), 400
+    content = f.read()
+    if len(content) < 100_000:
+        return jsonify({"error": f"File troppo piccolo ({len(content)} byte)"}), 400
+    try:
+        os.makedirs(os.path.dirname(AGENT_MSI_PATH), exist_ok=True)
+        with open(AGENT_MSI_PATH, "wb") as out:
+            out.write(content)
+    except Exception as e:
+        return jsonify({"error": f"Impossibile salvare: {e}"}), 500
+    return jsonify({"ok": True, "size_mb": round(len(content)/1024/1024, 1)})
+
+@app.route("/api/agent/upload", methods=["POST"])
+@require_login
+@require_admin
+def agent_upload():
+    version = request.form.get("version","").strip()
+    f = request.files.get("file")
+    if not f or not version:
+        return jsonify({"error": "File e versione obbligatori"}), 400
+    content = f.read()
+    if len(content) < 100_000:
+        return jsonify({"error": f"File troppo piccolo ({len(content)} byte) — carica l'EXE non il MSI"}), 400
+    try:
+        os.makedirs(os.path.dirname(AGENT_PATH), exist_ok=True)
+        with open(AGENT_PATH, "wb") as out:
+            out.write(content)
+    except Exception as e:
+        return jsonify({"error": f"Impossibile salvare il file: {e}"}), 500
+    with get_db() as db:
+        db.execute("INSERT OR REPLACE INTO agent_config VALUES ('version',?)", (version,))
+        db.commit()
+    return jsonify({"ok": True, "version": version, "size_mb": round(len(content)/1024/1024, 1)})
+
+# ── Machine delete / block ────────────────────────────────────
+@app.route("/api/machines/<mid>", methods=["DELETE"])
+@require_api_key
+@require_admin
+def delete_machine(mid):
+    with get_db() as db:
+        if not db.execute("SELECT 1 FROM machines WHERE id=?", (mid,)).fetchone(): abort(404)
+        db.execute("DELETE FROM machines WHERE id=?", (mid,))
+        db.commit()
+    return jsonify({"ok": True})
+
+@app.route("/api/machines/<mid>/block", methods=["PATCH"])
+@require_api_key
+@require_admin
+def block_machine(mid):
+    d = request.json or {}
+    blocked = 1 if d.get("blocked") else 0
+    with get_db() as db:
+        if not db.execute("SELECT 1 FROM machines WHERE id=?", (mid,)).fetchone(): abort(404)
+        db.execute("UPDATE machines SET blocked=? WHERE id=?", (blocked, mid))
+        db.commit()
+    return jsonify({"ok": True})
+
 # ── Machine assign ────────────────────────────────────────────
 @app.route("/api/machines/<mid>/assign", methods=["PATCH"])
 @require_api_key
@@ -587,31 +1368,159 @@ def assign_machine(mid):
 # ── Ticket / Heartbeat / Machines API ─────────────────────────
 def _upsert_machine(db, mid, pc, domain, data, now):
     existing = db.execute("SELECT * FROM machines WHERE id=?", (mid,)).fetchone()
+    if existing and existing["blocked"]:
+        return False  # macchina bloccata, non aggiornare
+    meta        = _json.dumps(data.get("meta", {})) if isinstance(data.get("meta"), dict) else data.get("meta", "")
+    device_type = data.get("device_type", "windows")
     if existing:
         db.execute("""UPDATE machines SET
             username=COALESCE(NULLIF(?,''),(SELECT username FROM machines WHERE id=?)),
             ip=COALESCE(NULLIF(?,''),(SELECT ip FROM machines WHERE id=?)),
+            os=COALESCE(NULLIF(?,''),(SELECT os FROM machines WHERE id=?)),
             rustdesk_id=COALESCE(NULLIF(?,''),(SELECT rustdesk_id FROM machines WHERE id=?)),
+            rd_temp_pwd=COALESCE(NULLIF(?,''),(SELECT rd_temp_pwd FROM machines WHERE id=?)),
             last_seen=?, status='online',
-            cpu=?, ram=?, disk=?
+            cpu=?, ram=?, disk=?,
+            agent_version=COALESCE(NULLIF(?,''),(SELECT agent_version FROM machines WHERE id=?)),
+            meta=COALESCE(NULLIF(?,''),(SELECT meta FROM machines WHERE id=?)),
+            device_type=COALESCE(NULLIF(?,''),(SELECT device_type FROM machines WHERE id=?))
             WHERE id=?""", (
             data.get("user",""), mid,
             data.get("ip",""),   mid,
+            data.get("os",""),   mid,
             data.get("rustdesk_id",""), mid,
+            data.get("rd_password",""), mid,
             now,
             data.get("cpu",0), data.get("ram",0), data.get("disk",0),
+            data.get("version",""), mid,
+            meta, mid,
+            device_type, mid,
             mid))
     else:
+        blocked_entry = db.execute("SELECT blocked FROM machines WHERE id=?", (mid,)).fetchone()
+        if blocked_entry and blocked_entry["blocked"]:
+            return False
         db.execute("""INSERT INTO machines
-            (id,pc_name,username,domain,ip,os,rustdesk_id,last_seen,status,cpu,ram,disk,oid,sid,did)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+            (id,pc_name,username,domain,ip,os,rustdesk_id,last_seen,status,cpu,ram,disk,oid,sid,did,meta,device_type)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
             mid, pc,
             data.get("user",""), domain,
             data.get("ip",""), data.get("os",""),
             data.get("rustdesk_id",""),
             now, "online",
             data.get("cpu",0), data.get("ram",0), data.get("disk",0),
-            None, None, None))
+            None, None, None,
+            meta, device_type))
+    return True
+
+def _build_ticket_email_html(tid, data):
+    """Costruisce l'HTML della notifica ticket."""
+    from email.mime.multipart import MIMEMultipart as _MPART
+    from email.mime.text import MIMEText as _MTEXT
+    pc      = data.get("pc_name","N/D")
+    utente  = data.get("user","—")
+    ip      = data.get("ip","—")
+    oggetto = data.get("subject") or data.get("oggetto") or f"Ticket #{tid}"
+    descr   = data.get("description","")
+    prio    = data.get("priority","normal")
+    categ   = data.get("categoria","")
+    rd_id   = data.get("rustdesk_id","")
+    rd_pwd  = data.get("rustdesk_pwd","") or _rd_permanent_password(data.get("pc_name",""), data.get("domain",""))
+    ora     = datetime.now().strftime("%d/%m/%Y %H:%M")
+    prio_colors = {"bassa":"#2ebd6b","media":"#f0a500","alta":"#e67e22","urgente":"#e53935","normal":"#f0a500","urgent":"#e53935"}
+    pcol = prio_colors.get(prio.lower(), "#f0a500")
+    html = f"""<html><body style="margin:0;padding:0;background:#f0f4f8;font-family:Arial,sans-serif;">
+<div style="max-width:560px;margin:30px auto;background:#fff;border-radius:10px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,.1)">
+  <div style="background:#1a3d6e;padding:24px 28px">
+    <div style="color:#fff;font-size:20px;font-weight:bold">UPTIME SERVICE — Nuovo Ticket #{tid}</div>
+    <div style="color:#a8c4e0;font-size:11px;margin-top:4px">{ora}</div>
+  </div>
+  <div style="padding:24px 28px">
+    <div style="margin-bottom:14px">
+      <span style="background:{pcol};color:#fff;font-size:11px;font-weight:bold;padding:3px 10px;border-radius:10px;text-transform:uppercase">{prio}</span>
+      {"<span style='background:#eef2f8;color:#1a3d6e;font-size:11px;font-weight:bold;padding:3px 10px;border-radius:10px;margin-left:6px'>"+categ+"</span>" if categ else ""}
+    </div>
+    <div style="font-size:16px;font-weight:bold;color:#1a3d6e;margin-bottom:16px">{oggetto}</div>
+    <div style="background:#f4f7fb;border-left:4px solid #2ebd6b;padding:12px 16px;border-radius:0 6px 6px 0;margin-bottom:16px;font-size:13px;color:#1a3d6e;white-space:pre-wrap">{descr}</div>
+    <table style="width:100%;border-collapse:collapse;font-size:12px">
+      <tr style="border-bottom:1px solid #eef2f8"><td style="padding:7px 8px;color:#888;width:35%">PC</td><td style="padding:7px 8px;font-weight:bold;color:#1a3d6e">{pc}</td></tr>
+      <tr style="border-bottom:1px solid #eef2f8;background:#f9fbfd"><td style="padding:7px 8px;color:#888">Utente</td><td style="padding:7px 8px;color:#1a3d6e">{utente}</td></tr>
+      <tr style="border-bottom:1px solid #eef2f8"><td style="padding:7px 8px;color:#888">IP</td><td style="padding:7px 8px;color:#1a3d6e">{ip}</td></tr>
+      {"<tr style='border-bottom:1px solid #eef2f8'><td style='padding:7px 8px;color:#888'>RustDesk ID</td><td style='padding:7px 8px;font-weight:bold;color:#2ebd6b;letter-spacing:2px'>"+rd_id+"</td></tr>" if rd_id else ""}
+      {"<tr><td style='padding:7px 8px;color:#888'>RustDesk Password</td><td style='padding:7px 8px;font-weight:bold;color:#e67e22;letter-spacing:2px'>"+rd_pwd+"</td></tr>" if rd_pwd else ""}
+    </table>
+  </div>
+  <div style="background:#f4f7fb;padding:12px 28px;text-align:center;font-size:10px;color:#aaa;border-top:1px solid #e8edf4">
+    Uptime Service RMM — notifica automatica
+  </div>
+</div></body></html>"""
+    subject = f"[Ticket #{tid}] {oggetto} — {pc}"
+    return subject, html
+
+
+def _do_send_ticket_email(cfg, dests, subject, html):
+    """Invia l'email a tutti i destinatari. Ritorna None se ok, stringa errore altrimenti."""
+    import smtplib
+    from email.mime.multipart import MIMEMultipart as _MPART
+    from email.mime.text import MIMEText as _MTEXT
+    host    = cfg["smtp_host"]
+    port    = int(cfg.get("smtp_port", 465))
+    user    = cfg["smtp_user"]
+    pwd     = cfg["smtp_password"]
+    display = cfg.get("smtp_from","").strip()
+    frm_hdr = f"{display} <{user}>" if display else user
+    ssl     = cfg.get("smtp_ssl","1") not in ("0","false","False")
+
+    def _send_all(conn):
+        conn.login(user, pwd)
+        for dest in dests:
+            m = _MPART("related")
+            m["From"]    = frm_hdr
+            m["To"]      = dest
+            m["Subject"] = subject
+            m.attach(_MTEXT(html, "html"))
+            conn.sendmail(user, dest, m.as_string())
+
+    try:
+        if ssl:
+            with smtplib.SMTP_SSL(host, port, timeout=15) as s:
+                _send_all(s)
+        else:
+            with smtplib.SMTP(host, port, timeout=15) as s:
+                s.starttls()
+                _send_all(s)
+        return None
+    except Exception as e:
+        return str(e)
+
+
+def _rd_permanent_password(pc_name, domain):
+    """Stessa logica dell'agente: password deterministica da pc_name+domain."""
+    mid = hashlib.md5(f"{pc_name}{domain}".encode()).hexdigest()
+    raw = hashlib.sha256(f"uptimermm-{mid}".encode()).hexdigest().upper()
+    chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+    return ''.join(c for c in raw if c in chars)[:10]
+
+
+def _notify_new_ticket(tid, data):
+    """Invia email di notifica — legge DB nel thread chiamante, spedisce in background."""
+    import threading as _thr
+    # Legge cfg e destinatari nel thread principale (sicuro con gevent)
+    with get_db() as db:
+        cfg   = {r[0]: r[1] for r in db.execute("SELECT key,value FROM settings WHERE key LIKE 'smtp_%'").fetchall()}
+        dests = [r[0] for r in db.execute("SELECT ticket_email FROM users WHERE ticket_email != '' AND disabled=0").fetchall()]
+    if not dests or not cfg.get("smtp_host") or not cfg.get("smtp_user") or not cfg.get("smtp_password"):
+        return
+    subject, html = _build_ticket_email_html(tid, data)
+
+    def _bg():
+        err = _do_send_ticket_email(cfg, dests, subject, html)
+        if err:
+            import logging as _log
+            _log.getLogger(__name__).error("_notify_new_ticket tid=%s: %s", tid, err)
+
+    _thr.Thread(target=_bg, daemon=True).start()
+
 
 @app.route("/api/ticket", methods=["POST"])
 @require_api_key
@@ -624,51 +1533,222 @@ def create_ticket():
         with get_db() as db:
             _upsert_machine(db, mid, pc, domain, data, now)
             db.execute("""INSERT INTO tickets
-                (machine_id,pc_name,username,ip,rustdesk_id,description,screenshot,status,priority,created_at,updated_at,note)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                (machine_id,pc_name,username,ip,rustdesk_id,rustdesk_pwd,description,screenshot,status,priority,created_at,updated_at,note)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
                 mid, pc,
                 data.get("user",""), data.get("ip",""),
-                data.get("rustdesk_id",""), data.get("description",""),
+                data.get("rustdesk_id",""), data.get("rustdesk_pwd",""),
+                data.get("description",""),
                 data.get("screenshot",""), "open",
                 data.get("priority","normal"), now, now, ""))
             tid = db.execute("SELECT last_insert_rowid()").fetchone()[0]
             db.commit()
+    _notify_new_ticket(tid, data)
     return jsonify({"ok":True,"ticket_id":tid,"machine_id":mid})
+
+def _cleanup_invites(db):
+    db.execute("DELETE FROM invites WHERE expires_at != '' AND expires_at < datetime('now')")
+
+@app.route("/api/invites", methods=["POST"])
+@require_api_key
+def create_invite():
+    d = request.json or {}
+    now = _now()
+    with get_db() as db:
+        _cleanup_invites(db)
+        db.execute(
+            "INSERT INTO invites (machine_id,pc_name,rustdesk_id,rustdesk_pwd,created_at,expires_at) VALUES (?,?,?,?,?,datetime('now','+1 hour'))",
+            (d.get("machine_id",""), d.get("pc_name","N/D"),
+             d.get("rustdesk_id",""), d.get("rustdesk_pwd",""), now))
+        db.commit()
+    return jsonify({"ok": True})
+
+@app.route("/api/invites", methods=["GET"])
+@require_api_key
+@require_login
+def get_invites():
+    with get_db() as db:
+        _cleanup_invites(db)
+        db.commit()
+        rows = _rows(db.execute("SELECT * FROM invites ORDER BY created_at DESC").fetchall())
+    return jsonify(rows)
+
+@app.route("/api/invites/<int:iid>", methods=["DELETE"])
+@require_api_key
+@require_login
+def delete_invite(iid):
+    with get_db() as db:
+        db.execute("DELETE FROM invites WHERE id=?", (iid,))
+        db.commit()
+    return jsonify({"ok": True})
 
 @app.route("/api/heartbeat", methods=["POST"])
 @require_api_key
 def heartbeat():
-    data = request.json or {}
-    pc = data.get("pc_name","N/D"); domain = data.get("domain","N/D")
-    mid = hashlib.md5(f"{pc}{domain}".encode()).hexdigest()[:12]
-    now = _now()
+    data   = request.json or {}
+    pc     = data.get("pc_name", "N/D")
+    domain = data.get("domain",  "N/D")
+    # Preferisce machine_id stabile inviato dall'agent; fallback MD5 per retrocompatibilità
+    mid    = data.get("machine_id") or hashlib.md5(f"{pc}{domain}".encode()).hexdigest()[:12]
+    now    = _now()
     with _lock:
         with get_db() as db:
             _upsert_machine(db, mid, pc, domain, data, now)
             db.commit()
-    return jsonify({"ok":True})
+    return jsonify({"ok": True})
+
+# ── Monitoring endpoints ─────────────────────────────────────────────────────
+
+@app.route("/api/monitoring/heartbeat", methods=["POST"])
+@require_api_key
+def monitoring_heartbeat():
+    """Heartbeat ricco inviato ogni 5 min dall'agent con dati di monitoring."""
+    data     = request.json or {}
+    pc       = data.get("hostname", "N/D")
+    mid      = data.get("machine_id") or ""
+    now      = _now()
+    overall  = data.get("overall_status", "ok")
+    problems = _json.dumps(data.get("problems", []) if isinstance(data.get("problems"), list) else [])
+
+    if not mid:
+        # fallback retrocompatibilità: cerca per hostname
+        with get_db() as db:
+            row = db.execute("SELECT id FROM machines WHERE pc_name=?", (pc,)).fetchone()
+            mid = row["id"] if row else hashlib.md5(pc.encode()).hexdigest()[:12]
+
+    with _lock:
+        with get_db() as db:
+            exists = db.execute("SELECT 1 FROM machines WHERE id=?", (mid,)).fetchone()
+            if not exists:
+                app.logger.warning(f"monitoring_heartbeat: macchina {mid!r} ({pc}) non trovata nel DB — heartbeat ignorato")
+                return jsonify({"ok": False, "error": "machine_not_found"}), 404
+
+            db.execute(
+                "UPDATE machines SET mon_status=?, mon_updated_at=?, mon_problems=?, "
+                "cpu=?, ram=?, disk=?, last_seen=?, status='online' WHERE id=?",
+                (overall, now, problems,
+                 int(data.get("cpu", 0)), int(data.get("ram", 0)),
+                 int(data.get("disk_used_pct", 0)), now, mid)
+            )
+            db.execute(
+                "INSERT INTO monitoring_events (machine_id, type, overall, payload, created_at) VALUES (?,?,?,?,?)",
+                (mid, "heartbeat", overall, _json.dumps(data), now)
+            )
+            # Mantieni ultimi 500 heartbeat per macchina
+            db.execute(
+                "DELETE FROM monitoring_events WHERE machine_id=? AND type='heartbeat' AND id NOT IN "
+                "(SELECT id FROM monitoring_events WHERE machine_id=? AND type='heartbeat' ORDER BY id DESC LIMIT 500)",
+                (mid, mid)
+            )
+            db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/monitoring/event", methods=["POST"])
+@require_api_key
+def monitoring_event():
+    """Evento di cambio stato inviato dall'agent (payload completo)."""
+    data    = request.json or {}
+    pc      = data.get("hostname", "N/D")
+    mid     = data.get("machine_id") or ""
+    now     = _now()
+    overall = data.get("overall_status", "ok")
+
+    if not mid:
+        with get_db() as db:
+            row = db.execute("SELECT id FROM machines WHERE pc_name=?", (pc,)).fetchone()
+            mid = row["id"] if row else hashlib.md5(pc.encode()).hexdigest()[:12]
+
+    with _lock:
+        with get_db() as db:
+            exists = db.execute("SELECT 1 FROM machines WHERE id=?", (mid,)).fetchone()
+            if not exists:
+                app.logger.warning(f"monitoring_event: macchina {mid!r} ({pc}) non trovata nel DB")
+                return jsonify({"ok": False, "error": "machine_not_found"}), 404
+
+            db.execute(
+                "INSERT INTO monitoring_events (machine_id, type, overall, payload, created_at) VALUES (?,?,?,?,?)",
+                (mid, "event", overall, _json.dumps(data), now)
+            )
+            # Mantieni ultimi 100 eventi completi per macchina
+            db.execute(
+                "DELETE FROM monitoring_events WHERE machine_id=? AND type='event' AND id NOT IN "
+                "(SELECT id FROM monitoring_events WHERE machine_id=? AND type='event' ORDER BY id DESC LIMIT 100)",
+                (mid, mid)
+            )
+            db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/machines/<mid>/monitoring", methods=["GET"])
+@require_login
+def machine_monitoring(mid):
+    """Restituisce l'ultimo event completo e gli ultimi 20 heartbeat di una macchina."""
+    with get_db() as db:
+        last_event = db.execute(
+            "SELECT payload, created_at FROM monitoring_events WHERE machine_id=? AND type='event' ORDER BY id DESC LIMIT 1",
+            (mid,)
+        ).fetchone()
+        heartbeats = db.execute(
+            "SELECT overall, created_at, payload FROM monitoring_events WHERE machine_id=? AND type='heartbeat' ORDER BY id DESC LIMIT 20",
+            (mid,)
+        ).fetchall()
+    return jsonify({
+        "last_event":  _json.loads(last_event["payload"]) if last_event else None,
+        "last_event_at": last_event["created_at"] if last_event else None,
+        "heartbeats": [
+            {"overall": r["overall"], "created_at": r["created_at"],
+             **{k: v for k, v in _json.loads(r["payload"]).items()
+                if k in ("cpu","ram","disk_used_pct","disk_free_gb","updates_missing","reboot_required","ping_internet","uptime_days")}}
+            for r in heartbeats
+        ],
+    })
+
+
+# SIGTERM handler: termina subito senza lasciare processi zombie su lswsgi
+import signal as _signal
+def _sigterm_handler(sig, frame):
+    raise SystemExit(0)
+_signal.signal(_signal.SIGTERM, _sigterm_handler)
+
 
 # ── Comandi remoti ───────────────────────────────────────────────────────────
+
+@app.route("/api/machines/<mid>/commands/flush", methods=["POST"])
+@require_login
+@require_admin
+def flush_commands(mid):
+    """Cancella tutti i comandi pending di una macchina."""
+    with get_db() as db:
+        db.execute("UPDATE commands SET status='done' WHERE machine_id=? AND status='pending'", (mid,))
+        db.commit()
+    return jsonify({"ok": True})
 
 @app.route("/api/machines/<mid>/command", methods=["POST"])
 @require_login
 def send_command(mid):
     """Dashboard invia un comando a una macchina (reboot, rustdesk)."""
     data = request.json or {}
-    cmd = data.get("command", "").strip()
-    if cmd not in ("reboot", "rustdesk"):
+    cmd      = data.get("command", "").strip()
+    duration = int(data.get("duration", 30))   # minuti
+    ALLOWED = {"reboot", "rustdesk", "rustdesk_stop", "update", "backup_config", "restart_interface"}
+    if cmd not in ALLOWED:
         return jsonify({"error": "Comando non valido"}), 400
     now = _now()
     token = None
     expires_at = None
     if cmd == "rustdesk":
-        token = secrets.token_urlsafe(32)
+        token      = secrets.token_urlsafe(32)
         expires_at = (datetime.now() + timedelta(minutes=5)).isoformat()
     with _lock:
         with get_db() as db:
+            if cmd == "rustdesk":
+                db.execute(
+                    "UPDATE machines SET rd_temp_pwd='', rd_tmp_expires='' WHERE id=?",
+                    (mid,))
             db.execute(
-                "INSERT INTO commands (machine_id, command, status, created_at, token, token_expires_at) VALUES (?,?,?,?,?,?)",
-                (mid, cmd, "pending", now, token, expires_at))
+                "INSERT INTO commands (machine_id, command, status, created_at, token, token_expires_at, duration) VALUES (?,?,?,?,?,?,?)",
+                (mid, cmd, "pending", now, token, expires_at, duration))
             db.commit()
     return jsonify({"ok": True, "command": cmd})
 
@@ -681,8 +1761,15 @@ def poll_commands(mid):
             "SELECT * FROM commands WHERE machine_id=? AND status='pending' ORDER BY id LIMIT 1",
             (mid,)).fetchone())
     if not row:
+        # Nessun comando: controlla messaggi chat non letti (dashboard→agente)
+        with get_db() as db:
+            chat = _row(db.execute(
+                "SELECT id, message FROM chat_messages WHERE machine_id=? AND direction='out' AND read_at IS NULL ORDER BY id LIMIT 1",
+                (mid,)).fetchone())
+        if chat:
+            return jsonify({"command": "chat", "id": chat["id"], "message": chat["message"]})
         return jsonify({"command": None})
-    return jsonify({"command": row["command"], "id": row["id"], "token": row["token"]})
+    return jsonify({"command": row["command"], "id": row["id"], "token": row["token"], "duration": row.get("duration", 30)})
 
 @app.route("/api/machines/<mid>/validate_token", methods=["POST"])
 @require_api_key
@@ -722,43 +1809,123 @@ def ack_command(mid):
     now = _now()
     with _lock:
         with get_db() as db:
+            row = _row(db.execute(
+                "SELECT command, duration FROM commands WHERE id=? AND machine_id=?",
+                (cid, mid)).fetchone())
+            cmd_type = row["command"] if row else ""
+            duration  = int(row["duration"]) if row and row.get("duration") else 30
             db.execute(
                 "UPDATE commands SET status='done', executed_at=? WHERE id=? AND machine_id=?",
                 (now, cid, mid))
             if rd_password:
-                expires = (datetime.now() + timedelta(minutes=5)).isoformat()
+                pwd_exp    = (datetime.now() + timedelta(minutes=5)).isoformat()
+                rd_exp     = (datetime.now() + timedelta(minutes=duration)).isoformat()
                 db.execute(
-                    "UPDATE machines SET rd_temp_pwd=?, rd_tmp_expires=? WHERE id=?",
-                    (rd_password, expires, mid))
+                    "UPDATE machines SET rd_temp_pwd=?, rd_tmp_expires=?, rd_active=1, rd_active_since=?, rd_expires_at=? WHERE id=?",
+                    (rd_password, pwd_exp, now, rd_exp, mid))
+            elif cmd_type == "rustdesk_stop":
+                db.execute(
+                    "UPDATE machines SET rd_active=0, rd_active_since='', rd_temp_pwd='', rd_tmp_expires='', rd_expires_at='' WHERE id=?",
+                    (mid,))
             db.commit()
     return jsonify({"ok": True})
+
+
+# ── Backup configurazione (pfSense e altri dispositivi) ──────────────────────
+
+@app.route("/api/machines/<mid>/backup", methods=["POST"])
+@require_api_key
+def upload_backup(mid):
+    """Agent invia il backup della configurazione (es. config.xml di pfSense)."""
+    data = request.json or {}
+    content  = data.get("content", "")
+    filename = data.get("filename", "backup.xml")
+    encoding = data.get("encoding", "")
+    if not content:
+        return jsonify({"error": "Contenuto mancante"}), 400
+    if encoding == "base64":
+        try:
+            content = base64.b64decode(content).decode("utf-8", errors="replace")
+        except Exception:
+            return jsonify({"error": "Decodifica base64 fallita"}), 400
+    with get_db() as db:
+        if not db.execute("SELECT 1 FROM machines WHERE id=?", (mid,)).fetchone(): abort(404)
+        db.execute(
+            "INSERT INTO backups (machine_id, filename, content, created_at) VALUES (?,?,?,?)",
+            (mid, filename, content, _now()))
+        # Conserva solo gli ultimi 10 backup per macchina
+        db.execute("""DELETE FROM backups WHERE machine_id=? AND id NOT IN (
+            SELECT id FROM backups WHERE machine_id=? ORDER BY id DESC LIMIT 10
+        )""", (mid, mid))
+        db.commit()
+    return jsonify({"ok": True})
+
+@app.route("/api/machines/<mid>/backup", methods=["GET"])
+@require_login
+def download_backup(mid):
+    """Dashboard scarica l'ultimo backup di configurazione."""
+    with get_db() as db:
+        row = _row(db.execute(
+            "SELECT * FROM backups WHERE machine_id=? ORDER BY id DESC LIMIT 1",
+            (mid,)).fetchone())
+    if not row:
+        return jsonify({"error": "Nessun backup disponibile"}), 404
+    return Response(
+        row["content"],
+        mimetype="application/xml",
+        headers={"Content-Disposition": f'attachment; filename="{row["filename"]}"'}
+    )
+
+@app.route("/api/machines/<mid>/backups", methods=["GET"])
+@require_login
+def list_backups(mid):
+    """Lista dei backup disponibili per la macchina."""
+    with get_db() as db:
+        rows = _rows(db.execute(
+            "SELECT id, filename, created_at FROM backups WHERE machine_id=? ORDER BY id DESC",
+            (mid,)).fetchall())
+    return jsonify(rows)
+
+@app.route("/api/machines/<mid>/backups/<int:bid>", methods=["GET"])
+@require_login
+def download_backup_by_id(mid, bid):
+    """Scarica un backup specifico per ID."""
+    with get_db() as db:
+        row = _row(db.execute(
+            "SELECT * FROM backups WHERE id=? AND machine_id=?",
+            (bid, mid)).fetchone())
+    if not row:
+        abort(404)
+    return Response(
+        row["content"],
+        mimetype="application/xml",
+        headers={"Content-Disposition": f'attachment; filename="{row["filename"]}"'}
+    )
 
 @app.route("/api/machines/<mid>/rd_session", methods=["GET"])
 @require_login
 def rd_session(mid):
-    """Dashboard polling: restituisce ID e password temporanea RustDesk se ancora valida."""
-    now = datetime.now().isoformat()
+    """Restituisce ID e password RustDesk della macchina (password permanente)."""
     with get_db() as db:
         row = _row(db.execute(
-            "SELECT rustdesk_id, rd_temp_pwd, rd_tmp_expires FROM machines WHERE id=?",
+            "SELECT rustdesk_id, rd_temp_pwd FROM machines WHERE id=?",
             (mid,)).fetchone())
     if not row or not row.get("rd_temp_pwd"):
         return jsonify({"ready": False})
-    if row["rd_tmp_expires"] and now > row["rd_tmp_expires"]:
-        return jsonify({"ready": False, "expired": True})
     return jsonify({
-        "ready":      True,
-        "rd_id":      row["rustdesk_id"],
-        "rd_pwd":     row["rd_temp_pwd"],
-        "expires_at": row["rd_tmp_expires"]
+        "ready":  True,
+        "rd_id":  row["rustdesk_id"],
+        "rd_pwd": row["rd_temp_pwd"]
     })
 
 @app.route("/api/machines")
 @require_api_key
 def get_machines():
     threshold = (datetime.now()-timedelta(minutes=5)).isoformat()
+    now_iso   = datetime.now().isoformat()
     with get_db() as db:
         db.execute("UPDATE machines SET status='offline' WHERE last_seen<?", (threshold,))
+        db.execute("UPDATE machines SET rd_active=0, rd_active_since='', rd_expires_at='' WHERE rd_active=1 AND rd_expires_at!='' AND rd_expires_at<?", (now_iso,))
         db.commit()
         rows = _rows(db.execute("SELECT * FROM machines ORDER BY pc_name").fetchall())
     # rinomina username -> user per compatibilità frontend
@@ -795,9 +1962,18 @@ def update_ticket(tid):
     data = request.json or {}
     with get_db() as db:
         if not db.execute("SELECT 1 FROM tickets WHERE id=?", (tid,)).fetchone(): abort(404)
-        for k in ["status","priority","note"]:
+        for k in ["status","priority","note","oggetto","org_id","assigned_to","type","origin"]:
             if k in data: db.execute(f"UPDATE tickets SET {k}=? WHERE id=?", (data[k], tid))
         db.execute("UPDATE tickets SET updated_at=? WHERE id=?", (_now(), tid))
+        db.commit()
+    return jsonify({"ok":True})
+
+@app.route("/api/ticket/<int:tid>", methods=["DELETE"])
+@require_api_key
+def delete_ticket(tid):
+    with get_db() as db:
+        if not db.execute("SELECT 1 FROM tickets WHERE id=?", (tid,)).fetchone(): abort(404)
+        db.execute("DELETE FROM tickets WHERE id=?", (tid,))
         db.commit()
     return jsonify({"ok":True})
 
@@ -815,49 +1991,6 @@ def get_stats():
     return jsonify({"total_machines":total,"online_machines":online,"offline_machines":total-online,
                     "open_tickets":t_open,"closed_tickets":t_close,"urgent_tickets":urgent,"total_orgs":norgs})
 
-@app.route("/api/demo", methods=["POST"])
-def demo_data():
-    now = _now()
-    with _lock:
-        with get_db() as db:
-            # Orgs
-            db.execute("DELETE FROM orgs WHERE id IN ('d1','d2')")
-            db.execute("INSERT OR REPLACE INTO orgs VALUES ('d1','Emotion Design Srl','#00d4aa',?)", (now,))
-            db.execute("INSERT OR REPLACE INTO orgs VALUES ('d2','Cliente Rossi Spa','#0091ff',?)", (now,))
-            # Sites
-            db.execute("INSERT OR REPLACE INTO sites VALUES ('s1','d1','Sede Milano','Via Roma 1, Milano',?)", (now,))
-            db.execute("INSERT OR REPLACE INTO sites VALUES ('s2','d1','Sede Roma','Via Veneto 10, Roma',?)", (now,))
-            db.execute("INSERT OR REPLACE INTO sites VALUES ('s3','d2','Sede Principale','Corso Italia 5, Torino',?)", (now,))
-            # Depts
-            db.execute("INSERT OR REPLACE INTO depts VALUES ('dp1','s1','d1','Amministrazione',?)", (now,))
-            db.execute("INSERT OR REPLACE INTO depts VALUES ('dp2','s1','d1','IT',?)", (now,))
-            db.execute("INSERT OR REPLACE INTO depts VALUES ('dp3','s2','d1','Commerciale',?)", (now,))
-            # Machines
-            ms = [
-                ("abc001","DESKTOP-MARIO","mario.rossi","EMOTIONDESIGN","192.168.1.10","Windows 11 Pro","123 456 789",now,"online",45,62,78,"d1","s1","dp1"),
-                ("abc002","LAPTOP-GIULIA","giulia.bianchi","EMOTIONDESIGN","192.168.1.11","Windows 10 Pro","987 654 321",now,"online",12,34,45,"d1","s1","dp2"),
-                ("abc003","PC-CONTABILITA","admin","WORKGROUP","192.168.1.20","Windows 10 Home","","2020-01-01","offline",0,0,0,"d1","s2","dp3"),
-                ("abc004","SERVER-FILE","Administrator","EMOTIONDESIGN","192.168.1.1","Windows Server 2022","111 222 333",now,"online",78,88,92,"d2","s3",None),
-            ]
-            for m in ms:
-                db.execute("""INSERT OR REPLACE INTO machines
-                    (id,pc_name,username,domain,ip,os,rustdesk_id,last_seen,status,cpu,ram,disk,oid,sid,did)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", m)
-            # Tickets
-            ts = [
-                ("abc001","DESKTOP-MARIO","mario.rossi","192.168.1.10","123 456 789","Il PC va lento, non riesco ad aprire Excel","urgent"),
-                ("abc002","LAPTOP-GIULIA","giulia.bianchi","192.168.1.11","987 654 321","Stampante non trovata in rete","normal"),
-                ("abc004","SERVER-FILE","Administrator","192.168.1.1","111 222 333","Disco quasi pieno 92%","urgent"),
-            ]
-            for t in ts:
-                existing = db.execute("SELECT 1 FROM tickets WHERE machine_id=? AND description=?", (t[0],t[5])).fetchone()
-                if not existing:
-                    db.execute("""INSERT INTO tickets
-                        (machine_id,pc_name,username,ip,rustdesk_id,description,screenshot,status,priority,created_at,updated_at,note)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (t[0],t[1],t[2],t[3],t[4],t[5],"","open",t[6],now,now,""))
-            db.commit()
-    return jsonify({"ok":True})
 
 # ═══════════════════════════════════════════════════════════════
 
@@ -1065,6 +2198,67 @@ def delete_doc_wiki(oid, wid):
         db.commit()
     return jsonify({"ok":True})
 
+# ── Password Vault ────────────────────────────────────────────
+@app.route("/api/orgs/<oid>/docs/passwords", methods=["GET"])
+@require_api_key
+def get_doc_passwords(oid):
+    with get_db() as db:
+        rows = _rows(db.execute("SELECT id,oid,title,description,username,url,notes,archived,created_at,updated_at FROM doc_passwords WHERE oid=? ORDER BY title", (oid,)).fetchall())
+    return jsonify(rows)
+
+@app.route("/api/orgs/<oid>/docs/passwords", methods=["POST"])
+@require_api_key
+def create_doc_password(oid):
+    d = request.json or {}
+    pid = _new_uid(); now = _now()
+    with get_db() as db:
+        db.execute("""INSERT INTO doc_passwords
+            (id,oid,title,description,username,password,url,notes,archived,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (pid, oid, d.get("title",""), d.get("description",""), d.get("username",""),
+             d.get("password",""), d.get("url",""), d.get("notes",""), 0, now, now))
+        db.commit()
+    return jsonify({"ok":True,"id":pid})
+
+@app.route("/api/orgs/<oid>/docs/passwords/<pid>", methods=["PATCH"])
+@require_api_key
+def update_doc_password(oid, pid):
+    d = request.json or {}
+    with get_db() as db:
+        if not db.execute("SELECT 1 FROM doc_passwords WHERE id=? AND oid=?", (pid,oid)).fetchone(): abort(404)
+        for k in ["title","description","username","password","url","notes","archived"]:
+            if k in d: db.execute(f"UPDATE doc_passwords SET {k}=? WHERE id=?", (d[k], pid))
+        db.execute("UPDATE doc_passwords SET updated_at=? WHERE id=?", (_now(), pid))
+        db.commit()
+    return jsonify({"ok":True})
+
+@app.route("/api/orgs/<oid>/docs/passwords/<pid>", methods=["DELETE"])
+@require_api_key
+def delete_doc_password(oid, pid):
+    with get_db() as db:
+        db.execute("DELETE FROM doc_passwords WHERE id=? AND oid=?", (pid, oid))
+        db.commit()
+    return jsonify({"ok":True})
+
+@app.route("/api/orgs/<oid>/docs/passwords/<pid>/reveal", methods=["POST"])
+@require_api_key
+def reveal_doc_password(oid, pid):
+    d = request.json or {}
+    user, _ = _current_user()
+    if not user: abort(403)
+    totp_code = d.get("totp_code","").strip()
+    if totp_code:
+        if not user.get("totp_enabled"): return jsonify({"error":"2FA non attivato"}), 403
+        if not _totp_verify(user["totp_secret"], totp_code): return jsonify({"error":"Codice 2FA non valido"}), 403
+    elif d.get("passkey_verified"):
+        pass  # verifica già avvenuta nel flow passkey
+    else:
+        return jsonify({"error":"Metodo di autenticazione non fornito"}), 400
+    with get_db() as db:
+        row = db.execute("SELECT password FROM doc_passwords WHERE id=? AND oid=?", (pid,oid)).fetchone()
+        if not row: abort(404)
+    return jsonify({"ok":True,"password":row[0]})
+
 # HTML TEMPLATES
 # ═══════════════════════════════════════════════════════════════
 
@@ -1109,6 +2303,8 @@ input:focus{outline:none;border-color:#00d4aa}
   <div class="form-row"><label>Username</label><input id="usr" type="text" placeholder="admin" autocomplete="username"></div>
   <div class="form-row"><label>Password</label><input id="pwd" type="password" placeholder="••••••••" autocomplete="current-password"></div>
   <button class="btn btn-p" onclick="doLogin()">Accedi →</button>
+  <div style="display:flex;align-items:center;gap:10px;margin:16px 0;color:#4a5568;font-size:11px;font-family:'JetBrains Mono',monospace"><div style="flex:1;height:1px;background:#2a3547"></div>oppure<div style="flex:1;height:1px;background:#2a3547"></div></div>
+  <button class="btn" style="background:transparent;color:#e6edf3;border:1px solid #2a3547;border-radius:8px;padding:12px;width:100%;font-size:13px;font-weight:700;cursor:pointer;font-family:'Syne',sans-serif;transition:all .2s" onmouseover="this.style.borderColor='#00d4aa';this.style.color='#00d4aa'" onmouseout="this.style.borderColor='#2a3547';this.style.color='#e6edf3'" onclick="loginWithPasskey()">🔑 Accedi con Passkey</button>
   <p class="hint">Default: <span>admin</span> / <span>admin</span></p>
 </div>
 <script>
@@ -1123,7 +2319,37 @@ async function doLogin(){
   if(d.needs_2fa){window.location='/login/2fa'}else{window.location='/'}
 }
 function showErr(msg){const e=document.getElementById('err');e.textContent=msg;e.style.display='block'}
+function _b64uToBuf(b){const p=b.replace(/-/g,'+').replace(/_/g,'/');const bin=atob(p);const buf=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)buf[i]=bin.charCodeAt(i);return buf.buffer}
+function _bufToB64u(buf){const bytes=new Uint8Array(buf);let s='';for(let i=0;i<bytes.byteLength;i++)s+=String.fromCharCode(bytes[i]);return btoa(s).replace(/[+]/g,'-').replace(/[/]/g,'_').replace(/=/g,'')}
+async function loginWithPasskey(){
+  const usr=document.getElementById('usr').value.trim();
+  try{
+    const b=await fetch('/api/auth/passkey/auth/begin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:usr})});
+    const opts=await b.json();
+    if(opts.error){showErr(opts.error);return}
+    const key=opts._key; delete opts._key;
+    opts.challenge=_b64uToBuf(opts.challenge);
+    if(opts.allowCredentials)opts.allowCredentials=opts.allowCredentials.map(c=>({...c,id:_b64uToBuf(c.id)}));
+    const cred=await navigator.credentials.get({publicKey:opts});
+    const payload={_key:key,id:cred.id,rawId:_bufToB64u(cred.rawId),type:cred.type,response:{
+      authenticatorData:_bufToB64u(cred.response.authenticatorData),
+      clientDataJSON:_bufToB64u(cred.response.clientDataJSON),
+      signature:_bufToB64u(cred.response.signature),
+      userHandle:cred.response.userHandle?_bufToB64u(cred.response.userHandle):null
+    }};
+    const r=await fetch('/api/auth/passkey/auth/finish',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const d=await r.json();
+    if(d.ok){window.location='/'}else{showErr(d.error||'Autenticazione fallita')}
+  }catch(e){if(e.name!=='NotAllowedError')showErr('Errore: '+e.message)}
+}
 </script>
+<style>
+.download-bar{margin-top:28px;padding-top:20px;border-top:1px solid #2a3547;text-align:center}
+.download-bar p{font-size:11px;color:#8b949e;margin-bottom:10px;font-family:'JetBrains Mono',monospace}
+.btn-download{display:inline-flex;align-items:center;gap:8px;background:transparent;border:1px solid #2a3547;color:#e6edf3;border-radius:8px;padding:9px 18px;font-size:12px;font-family:'Syne',sans-serif;font-weight:600;cursor:pointer;text-decoration:none;transition:all .2s}
+.btn-download:hover{border-color:#00d4aa;color:#00d4aa}
+.btn-download svg{flex-shrink:0}
+</style>
 </body>
 </html>"""
 
@@ -1227,6 +2453,12 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
 .nav-item.active{background:rgba(0,212,170,.1);color:var(--accent);box-shadow:inset 3px 0 0 var(--accent)}
 .nav-badge{margin-left:auto;background:var(--red);color:#fff;font-size:9px;font-weight:700;padding:2px 6px;border-radius:8px;font-family:'JetBrains Mono',monospace}
 .nav-badge.g{background:var(--accent);color:#000}
+.nav-sub{overflow:hidden;max-height:0;transition:max-height .25s ease}
+.nav-sub.open{max-height:300px}
+.nav-sub-item{display:flex;align-items:center;gap:8px;padding:7px 10px 7px 22px;border-radius:7px;font-size:11px;font-weight:500;color:var(--text2);cursor:pointer;transition:all .15s;margin-bottom:1px}
+.nav-sub-item:hover{background:var(--bg2);color:var(--text)}
+.nav-sub-item.active{background:rgba(0,212,170,.08);color:var(--accent)}
+.nav-sub-count{margin-left:auto;font-size:9px;font-family:'JetBrains Mono',monospace;color:var(--text3)}
 .sb-foot{padding:14px;border-top:1px solid var(--border);font-size:10px;color:var(--text3);font-family:'JetBrains Mono',monospace;flex-shrink:0}
 .dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--accent);margin-right:5px;animation:pulse 2s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
@@ -1324,6 +2556,8 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
 .bo{background:rgba(0,145,255,.15);color:var(--accent2);border:1px solid rgba(0,145,255,.3)}
 .bc{background:rgba(74,85,104,.2);color:var(--text3);border:1px solid var(--border)}
 .bu{background:rgba(255,71,87,.15);color:var(--red);border:1px solid rgba(255,71,87,.3)}
+.bd{background:rgba(255,71,87,.08);color:#e05c5c;border:1px solid rgba(255,71,87,.2)}
+.ba{background:rgba(240,165,0,.1);color:#f0a500;border:1px solid rgba(240,165,0,.3)}
 
 /* Users table */
 .user-row{display:flex;align-items:center;gap:12px;padding:12px 18px;border-bottom:1px solid rgba(42,53,71,.4)}
@@ -1389,12 +2623,63 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
 .otp-verify-inputs{display:flex;gap:6px;margin:10px 0}
 .otp-verify-inputs input{width:38px;height:44px;background:var(--bg3);border:1px solid var(--border);border-radius:7px;color:var(--accent);font-size:20px;font-weight:700;font-family:'JetBrains Mono',monospace;text-align:center;transition:border-color .2s}
 .otp-verify-inputs input:focus{outline:none;border-color:var(--accent)}
+
+/* ── Mobile responsive ───────────────────────────────────────── */
+.hamburger{display:none;flex-direction:column;gap:4px;cursor:pointer;padding:7px;border-radius:7px;background:var(--bg3);border:1px solid var(--border);flex-shrink:0}
+.hamburger span{display:block;width:18px;height:2px;background:var(--text2);border-radius:2px;transition:all .25s}
+.hamburger.open span:nth-child(1){transform:translateY(6px) rotate(45deg)}
+.hamburger.open span:nth-child(2){opacity:0}
+.hamburger.open span:nth-child(3){transform:translateY(-6px) rotate(-45deg)}
+.mob-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:98;backdrop-filter:blur(2px)}
+.mob-overlay.open{display:block}
+@media(max-width:800px){
+  body{overflow:auto;flex-direction:column;height:auto;min-height:100vh}
+  .hamburger{display:flex}
+  .sidebar{position:fixed;left:-250px;top:0;bottom:0;z-index:99;width:240px;transition:left .28s cubic-bezier(.4,0,.2,1);box-shadow:4px 0 30px rgba(0,0,0,.6);height:100vh}
+  .sidebar.mob-open{left:0}
+  .main{width:100%;min-width:0;display:flex;flex-direction:column;min-height:100vh}
+  .topbar{padding:10px 14px;position:sticky;top:0;z-index:50}
+  .topbar-right .admin-only{display:none!important}
+  .content{padding:12px 10px;overflow-y:visible}
+  .stats{grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:14px}
+  .sval{font-size:22px}
+  .org-cards{grid-template-columns:1fr}
+  .grid2{grid-template-columns:1fr}
+  .modal{width:96vw;max-width:96vw;max-height:94vh;margin:3vh auto}
+  .mh{padding:14px 16px}
+  .mb{padding:14px 16px}
+  .dev-table{display:block;overflow-x:auto;-webkit-overflow-scrolling:touch;white-space:nowrap}
+  .filter-bar{gap:6px;margin-bottom:12px}
+  .tabs{overflow-x:auto;flex-wrap:nowrap;padding-bottom:2px}
+  .tab{flex-shrink:0;padding:6px 11px;font-size:10px}
+  .topbar-title{font-size:13px}
+  .topbar-right{gap:5px}
+  .btn{padding:5px 9px;font-size:10px}
+  .breadcrumb{display:none}
+  #toasts{bottom:10px;right:8px;left:8px}
+  .toast{min-width:unset}
+  .user-chip span:last-child{display:none}
+  .ph{padding:11px 14px;flex-wrap:wrap;gap:6px}
+  .ph .btn{font-size:9px;padding:4px 8px}
+  .titem{padding:10px 12px}
+  .igrid{grid-template-columns:1fr}
+  .form-actions{flex-wrap:wrap}
+  .rdbox{flex-direction:column;gap:8px;align-items:flex-start}
+}
+@media(max-width:420px){
+  .stats{grid-template-columns:1fr}
+  .scard{padding:12px}
+  .modal{width:100vw;max-width:100vw;border-radius:0;margin:0;max-height:100vh}
+}
 </style>
 </head>
 <body>
 
+<!-- Mobile sidebar overlay -->
+<div class="mob-overlay" id="mob-overlay" onclick="closeSidebar()"></div>
+
 <!-- SIDEBAR -->
-<nav class="sidebar">
+<nav class="sidebar" id="sidebar">
   <div class="logo" style="padding:14px 16px;justify-content:center">
     <img src="data:image/png;base64,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" style="height:38px;width:auto;object-fit:contain" alt="Uptime Service">
   </div>
@@ -1403,14 +2688,26 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
     <div class="nav-item active" onclick="showView('overview',this)">⬡ &nbsp;Overview</div>
     <div class="nav-item" onclick="showView('orgs',this)">🏢 &nbsp;Organizzazioni <span class="nav-badge g" id="nb-orgs">0</span></div>
     <div class="nav-item" onclick="showView('devices',this)">◉ &nbsp;Tutti i Device <span class="nav-badge g" id="nb-dev">0</span></div>
-    <div class="nav-item" onclick="showView('tickets',this)">◈ &nbsp;Ticket <span class="nav-badge" id="nb-t">0</span></div>
-    <div class="nav-item admin-only" onclick="showView('users',this)">👤 &nbsp;Utenti</div>
+    <div class="nav-item" onclick="showView('invites',this)">📨 &nbsp;Inviti <span class="nav-badge" id="nb-invites" style="display:none">0</span></div>
+    <div class="nav-item" id="nav-ticket-parent" onclick="toggleTicketMenu(this)">◈ &nbsp;Ticket <span class="nav-badge" id="nb-t">0</span><span style="margin-left:auto;font-size:9px" id="nav-ticket-arrow">▶</span></div>
+    <div class="nav-sub" id="nav-ticket-sub">
+      <div class="nav-sub-item" onclick="setTicketView('new',this)">✏ Creazione ticket</div>
+      <div class="nav-sub-item" onclick="setTicketView('unassigned',this)">○ Ticket non assegnati <span class="nav-sub-count" id="ns-unassigned">0</span></div>
+      <div class="nav-sub-item active" onclick="setTicketView('all',this)">≡ Tutti i ticket <span class="nav-sub-count" id="ns-all">0</span></div>
+      <div class="nav-sub-item" onclick="setTicketView('mine',this)">◉ I miei ticket <span class="nav-sub-count" id="ns-mine">0</span></div>
+      <div class="nav-sub-item" onclick="setTicketView('open',this)">● Ticket aperti <span class="nav-sub-count" id="ns-open">0</span></div>
+      <div class="nav-sub-item" onclick="setTicketView('archived',this)">⊘ Ticket archiviati <span class="nav-sub-count" id="ns-archived">0</span></div>
+      <div class="nav-sub-item" onclick="setTicketView('deleted',this)">✕ Ticket eliminati <span class="nav-sub-count" id="ns-deleted">0</span></div>
+      <div class="nav-sub-item" onclick="setTicketView('email',this)">✉ E-mail in sospeso <span class="nav-sub-count" id="ns-email">0</span></div>
+    </div>
     <div class="nav-sec">ORGANIZZAZIONI</div>
     <div class="org-tree" id="org-tree"></div>
     <div class="nav-sec">SISTEMA</div>
     <div class="nav-item" onclick="openNewOrg()">+ &nbsp;Nuova Org</div>
-    <div class="nav-item" onclick="loadDemo()">◎ &nbsp;Carica Demo</div>
-    <div class="nav-item" onclick="refreshAll()">↺ &nbsp;Aggiorna</div>
+    <div class="nav-item admin-only" id="nav-settings-parent" onclick="toggleSettingsMenu(this)" style="display:none">⚙ &nbsp;Impostazioni<span style="margin-left:auto;font-size:9px" id="nav-settings-arrow">▶</span></div>
+    <div class="nav-sub" id="nav-settings-sub">
+      <div class="nav-sub-item" onclick="showView('settings-mail',this)">✉ Posta elettronica</div>
+    </div>
   </div>
   <div class="sb-foot"><span class="dot"></span>LIVE <span id="clk" style="float:right">--:--</span></div>
 </nav>
@@ -1419,6 +2716,9 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
 <div class="main">
   <div class="topbar">
     <div class="topbar-left">
+      <div class="hamburger" id="hamburger" onclick="toggleSidebar()" title="Menu">
+        <span></span><span></span><span></span>
+      </div>
       <div class="topbar-title">Uptime <span>Dashboard</span></div>
       <div class="breadcrumb" id="breadcrumb"></div>
     </div>
@@ -1428,8 +2728,11 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
         <span id="user-name">—</span>
         <span id="user-role-badge"></span>
       </div>
+      <span class="admin-only" style="display:none">
+        <button class="btn btn-b" onclick="showView('users',null)" style="font-size:10px;padding:6px 10px">👤 Utenti</button>
+        <button class="btn btn-b" onclick="showView('agent',null)" style="font-size:10px;padding:6px 10px">⬆ Agent</button>
+      </span>
       <button class="btn btn-g" onclick="doLogout()" style="font-size:10px;padding:6px 10px">↩ Esci</button>
-      <button class="btn btn-p" onclick="refreshAll()">↺ Refresh</button>
     </div>
   </div>
 
@@ -1453,6 +2756,12 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
         <div class="panel">
           <div class="ph"><div class="ptitle"><span class="pdot"></span>Device recenti</div><button class="btn btn-g" style="font-size:10px;padding:5px 10px" onclick="showView('devices',null)">Vedi tutti →</button></div>
           <div id="ov-devices"></div>
+        </div>
+      </div>
+      <div id="ov-invites-panel" style="display:none;margin-top:18px">
+        <div class="panel">
+          <div class="ph"><div class="ptitle"><span class="pdot" style="background:#e67e22"></span>📨 Inviti in attesa</div><button class="btn btn-g" style="font-size:10px;padding:5px 10px" onclick="showView('invites',null)">Vedi tutti →</button></div>
+          <div id="ov-invites"></div>
         </div>
       </div>
     </div>
@@ -1485,24 +2794,36 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
       <div class="panel">
         <table class="dev-table">
           <thead><tr>
-            <th>Device</th><th>Organizzazione</th><th>Sede</th><th>Reparto</th><th>Risorse</th><th>RustDesk</th><th>Comandi</th>
+            <th>Device</th><th>Organizzazione</th><th>Sede</th><th>Reparto</th><th>Risorse</th><th>RustDesk</th><th>Comandi</th><th>Agent</th>
           </tr></thead>
           <tbody id="dev-tbody"></tbody>
         </table>
       </div>
     </div>
 
+    <!-- INVITI -->
+    <div id="view-invites" class="view">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:18px">
+        <div style="font-size:18px;font-weight:700;color:var(--text1)">📨 Inviti di connessione</div>
+        <button class="btn btn-g" style="font-size:11px" onclick="loadInvites()">↺ Aggiorna</button>
+      </div>
+      <div id="invites-list"></div>
+    </div>
+
     <!-- TICKETS -->
     <div id="view-tickets" class="view">
       <div class="filter-bar">
         <input class="search-input" id="t-search" placeholder="Cerca ticket..." oninput="renderTickets()">
-        <div class="tabs">
-          <div class="tab active" onclick="setTFilter('all',this)">Tutti</div>
-          <div class="tab" onclick="setTFilter('open',this)">Aperti</div>
-          <div class="tab" onclick="setTFilter('closed',this)">Chiusi</div>
-        </div>
+        <button class="btn btn-p" style="font-size:11px;padding:6px 12px" onclick="openNewTicket()">+ Nuovo Ticket</button>
       </div>
-      <div class="panel"><div id="t-list"></div></div>
+      <div class="panel" style="overflow-x:auto">
+        <table class="dev-table" id="t-table">
+          <thead><tr>
+            <th>Stato</th><th>Oggetto</th><th>Organizzazione</th><th>Richiedente</th><th>Assegnatario</th><th>Origine</th><th>Creato</th><th>Ora</th><th></th>
+          </tr></thead>
+          <tbody id="t-list"></tbody>
+        </table>
+      </div>
     </div>
 
     <!-- USERS (admin only) -->
@@ -1517,6 +2838,116 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
       </div>
     </div>
 
+
+    <!-- IMPOSTAZIONI MAIL -->
+    <div id="view-settings-mail" class="view">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:18px">
+        <div style="font-size:14px;font-weight:700">✉ Impostazioni Posta Elettronica</div>
+      </div>
+      <div class="panel" style="max-width:560px">
+        <div class="ph"><div class="ptitle"><span class="pdot"></span>Configurazione SMTP</div></div>
+        <div style="padding:20px;display:flex;flex-direction:column;gap:12px">
+          <div class="form-row"><label class="form-label">Server SMTP (host)</label><input class="form-input" id="smtp-host" placeholder="smtp.gmail.com"></div>
+          <div style="display:flex;gap:12px">
+            <div class="form-row" style="flex:2"><label class="form-label">Porta</label><input class="form-input" id="smtp-port" type="number" placeholder="465"></div>
+            <div class="form-row" style="flex:3;display:flex;flex-direction:column;justify-content:flex-end">
+              <label style="display:flex;align-items:center;gap:8px;font-size:12px;cursor:pointer;padding-top:20px">
+                <input type="checkbox" id="smtp-ssl" checked style="width:14px;height:14px"> Usa SSL/TLS
+              </label>
+            </div>
+          </div>
+          <div class="form-row"><label class="form-label">Email mittente (utente SMTP)</label><input class="form-input" id="smtp-user" type="email" placeholder="noreply@tuodominio.it"></div>
+          <div class="form-row"><label class="form-label">Password SMTP</label><input class="form-input" id="smtp-password" type="password" placeholder="lascia vuoto per non modificare"></div>
+          <div class="form-row"><label class="form-label">Nome mittente visualizzato</label><input class="form-input" id="smtp-from" placeholder="Uptime Service RMM"></div>
+          <div class="form-actions" style="margin-top:4px;display:flex;gap:8px;flex-wrap:wrap">
+            <button class="btn btn-p" onclick="saveMailSettings()">💾 Salva impostazioni</button>
+          </div>
+        </div>
+      </div>
+      <div class="panel" style="max-width:560px;margin-top:16px">
+        <div class="ph"><div class="ptitle"><span class="pdot"></span>Invia email di test</div></div>
+        <div style="padding:20px;display:flex;flex-direction:column;gap:12px">
+          <div class="form-row"><label class="form-label">Indirizzo destinatario test</label><input class="form-input" id="smtp-test-to" type="email" placeholder="tuo@email.it"></div>
+          <div class="form-actions">
+            <button class="btn" style="background:#f0a500;color:#000;font-weight:bold" onclick="sendTestMail()">✉ Invia email di test</button>
+          </div>
+          <div id="smtp-test-result" style="font-size:12px;margin-top:4px"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- AGENT UPDATE -->
+    <div id="view-agent" class="view">
+      <div style="font-size:14px;font-weight:700;margin-bottom:18px">Gestione Agent</div>
+      <div style="display:flex;gap:18px;flex-wrap:wrap;align-items:flex-start">
+
+        <!-- ── Colonna sinistra: EXE aggiornamento automatico ── -->
+        <div class="panel" style="flex:1;min-width:300px;max-width:480px">
+          <div class="ph"><div class="ptitle"><span class="pdot"></span>Aggiornamento automatico (.exe)</div></div>
+          <div style="padding:16px">
+            <div style="font-size:13px;margin-bottom:10px">Versione distribuita: <span id="agent-cur-version" style="font-family:monospace;color:var(--accent);font-weight:700">—</span></div>
+            <div style="font-size:11px;color:var(--text2);margin-bottom:14px">I client scaricano l'EXE al prossimo heartbeat e si aggiornano automaticamente.</div>
+            <div class="form-row"><label class="form-label">Nuova versione</label><input class="form-input" id="agent-new-version" placeholder="1.0.9"></div>
+            <div class="form-row"><label class="form-label">File .exe</label><input class="form-input" id="agent-file" type="file" accept=".exe"></div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
+              <button class="btn btn-p" onclick="uploadAgent()">⬆ Pubblica</button>
+              <button class="btn" style="background:#f0a500;color:#000;font-weight:bold" onclick="updateAllAgents()">⬆ Aggiorna tutti ora</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- ── Colonna destra: MSI installer + link token ── -->
+        <div style="flex:1;min-width:300px;max-width:520px;display:flex;flex-direction:column;gap:16px">
+
+          <!-- MSI upload -->
+          <div class="panel">
+            <div class="ph"><div class="ptitle"><span class="pdot" style="background:#0078d4"></span>Installer MSI (prima installazione)</div></div>
+            <div style="padding:16px">
+              <div style="font-size:11px;color:var(--text2);margin-bottom:14px">Carica il file MSI da distribuire ai nuovi clienti tramite link. Stato: <span id="msi-status" style="font-weight:600">—</span></div>
+              <div class="form-row"><label class="form-label">File .msi</label><input class="form-input" id="agent-msi-file" type="file" accept=".msi"></div>
+              <button class="btn btn-p" onclick="uploadAgentMsi()" style="background:#0078d4;margin-top:8px">⬆ Carica MSI</button>
+            </div>
+          </div>
+
+          <!-- Link con token -->
+          <div class="panel">
+            <div class="ph" style="display:flex;align-items:center;justify-content:space-between">
+              <div class="ptitle"><span class="pdot" style="background:#9b59b6"></span>Link download clienti</div>
+              <button class="btn btn-p btn-sm" onclick="showCreateToken()" style="background:#9b59b6">+ Nuovo link</button>
+            </div>
+            <div style="padding:16px">
+              <div style="font-size:11px;color:var(--text2);margin-bottom:14px">Link pubblici con token da inviare ai clienti. Nessun login richiesto. Puoi impostare scadenza e numero massimo di download.</div>
+
+              <!-- Form nuovo token -->
+              <div id="create-token-form" style="display:none;background:#0d1117;border:1px solid #2a3547;border-radius:8px;padding:14px;margin-bottom:14px">
+                <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
+                  <div style="flex:1;min-width:140px">
+                    <label style="font-size:10px;color:var(--text2);display:block;margin-bottom:4px;text-transform:uppercase;letter-spacing:1px">Etichetta</label>
+                    <input class="form-input" id="tk-label" placeholder="es. Cliente Rossi">
+                  </div>
+                  <div>
+                    <label style="font-size:10px;color:var(--text2);display:block;margin-bottom:4px;text-transform:uppercase;letter-spacing:1px">Scadenza (giorni)</label>
+                    <input class="form-input" id="tk-days" type="number" value="0" min="0" style="width:90px">
+                  </div>
+                  <div>
+                    <label style="font-size:10px;color:var(--text2);display:block;margin-bottom:4px;text-transform:uppercase;letter-spacing:1px">Max download</label>
+                    <input class="form-input" id="tk-uses" type="number" value="-1" min="-1" style="width:90px">
+                  </div>
+                </div>
+                <div style="display:flex;gap:8px;margin-top:10px">
+                  <button class="btn btn-p btn-sm" onclick="createToken()" style="background:#9b59b6">Genera link</button>
+                  <button class="btn btn-sm" onclick="document.getElementById('create-token-form').style.display='none'">Annulla</button>
+                </div>
+              </div>
+
+              <!-- Lista token -->
+              <div id="token-list"><div style="color:var(--text2);font-size:12px;font-style:italic">Nessun link generato.</div></div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </div>
 
     <!-- DOCUMENTAZIONE ORG -->
     <div id="view-org-docs" class="view">
@@ -1546,6 +2977,88 @@ let allOrgs=[], allSites=[], allDepts=[], allMachines=[], allTickets=[], allUser
 let devFilter='all', tFilter='all';
 let selColor='#00d4aa';
 let currentUser = null;
+let _chatUnread = {};  // { machine_id: count_unread_from_agent }
+let _chatPollTimer = null;
+let _chatCurrentMid = null;
+
+// ── CHAT ──────────────────────────────────────────────────────
+async function openChatModal(mid, pcName){
+  _chatCurrentMid = mid;
+  // Crea la modale chat
+  const modal = document.createElement('div');
+  modal.id = 'chat-modal';
+  modal.style.cssText='position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.55)';
+  modal.innerHTML=`
+    <div style="background:var(--bg2);border-radius:12px;width:480px;max-width:96vw;height:min(520px,90vh);display:flex;flex-direction:column;box-shadow:0 8px 40px rgba(0,0,0,.4)">
+      <div style="padding:14px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px">
+        <span style="font-size:18px">💬</span>
+        <div style="flex:1">
+          <div style="font-weight:700;font-size:14px">${esc(pcName)}</div>
+          <div style="font-size:11px;color:var(--text3)">Chat con agente</div>
+        </div>
+        <button class="btn btn-d" style="padding:4px 10px;font-size:12px" onclick="closeChatModal()">✕</button>
+      </div>
+      <div id="chat-msgs" style="flex:1;overflow-y:auto;padding:12px 14px;display:flex;flex-direction:column;gap:8px"></div>
+      <div style="padding:10px 14px;border-top:1px solid var(--border);display:flex;gap:8px">
+        <input id="chat-input" type="text" placeholder="Scrivi un messaggio..." style="flex:1;background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:8px 12px;color:var(--text1);font-size:13px;outline:none" onkeydown="if(event.key==='Enter')sendChatMsg()">
+        <button class="btn btn-b" style="padding:8px 16px;font-size:13px" onclick="sendChatMsg()">Invia</button>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+  modal.addEventListener('click', e=>{ if(e.target===modal) closeChatModal(); });
+  await refreshChat(mid);
+  _chatPollTimer = setInterval(()=>refreshChat(mid), 3000);
+}
+
+function closeChatModal(){
+  if(_chatPollTimer){ clearInterval(_chatPollTimer); _chatPollTimer=null; }
+  _chatCurrentMid = null;
+  const m = document.getElementById('chat-modal');
+  if(m) m.remove();
+}
+
+async function refreshChat(mid){
+  try{
+    const msgs = await api(`/api/machines/${mid}/chat`);
+    const box = document.getElementById('chat-msgs');
+    if(!box) return;
+    // Conta unread agente (direction='in' senza read_at nella direzione opposta — qui tutti i 'in' sono già letti)
+    box.innerHTML = msgs.map(m=>{
+      const isOut = m.direction==='out';
+      const t = m.sent_at ? new Date(m.sent_at).toLocaleTimeString('it-IT',{hour:'2-digit',minute:'2-digit'}) : '';
+      const unreadDot = (!isOut && !m.read_at) ? '<span style="width:7px;height:7px;border-radius:50%;background:#e74c3c;display:inline-block;margin-left:4px"></span>' : '';
+      const senderName = m.sender || (isOut ? 'Dashboard' : 'Agente');
+      return `<div style="display:flex;flex-direction:column;align-items:${isOut?'flex-end':'flex-start'}">
+        <div style="max-width:80%;background:${isOut?'#1a6fb5':'var(--bg3)'};color:${isOut?'#fff':'var(--text1)'};border-radius:${isOut?'12px 12px 2px 12px':'12px 12px 12px 2px'};padding:8px 12px;font-size:13px;word-break:break-word">${esc(m.message)}</div>
+        <div style="font-size:10px;color:var(--text3);margin-top:2px">${esc(senderName)} · ${t}${unreadDot}</div>
+      </div>`;
+    }).join('');
+    box.scrollTop = box.scrollHeight;
+    // Aggiorna badge unread (messaggi 'in' non ancora visti — qui li contiamo come msgs da agente)
+    _chatUnread[mid] = 0;
+    renderDevices();
+  }catch(e){}
+}
+
+async function sendChatMsg(){
+  const inp = document.getElementById('chat-input');
+  if(!inp || !_chatCurrentMid) return;
+  const msg = inp.value.trim();
+  if(!msg) return;
+  inp.value='';
+  try{
+    await api(`/api/machines/${_chatCurrentMid}/chat`,{method:'POST',body:JSON.stringify({message:msg})});
+    await refreshChat(_chatCurrentMid);
+  }catch(e){ toast('Errore invio messaggio'); }
+}
+
+async function loadChatUnread(){
+  try{
+    // Carica unread per tutte le macchine: conta messaggi 'in' senza read_at per ogni macchina
+    // Il server non ha un endpoint aggregato, usiamo un approccio leggero: ignoriamo per ora
+    // (i badge si azzerano quando si apre la chat)
+  }catch(e){}
+}
 
 async function api(path,opts={}){
   const r=await fetch(path,{headers:H,...opts});
@@ -1575,6 +3088,21 @@ async function initAuth(){
 async function doLogout(){
   await fetch('/api/auth/logout',{method:'POST',headers:H});
   window.location='/login';
+}
+
+// ── MOBILE SIDEBAR ─────────────────────────────────────────────
+function toggleSidebar(){
+  const sb=document.getElementById('sidebar');
+  const hb=document.getElementById('hamburger');
+  const ov=document.getElementById('mob-overlay');
+  sb.classList.toggle('mob-open');
+  hb.classList.toggle('open');
+  ov.classList.toggle('open');
+}
+function closeSidebar(){
+  document.getElementById('sidebar').classList.remove('mob-open');
+  document.getElementById('hamburger').classList.remove('open');
+  document.getElementById('mob-overlay').classList.remove('open');
 }
 
 // ── PROFILE MODAL ─────────────────────────────────────────────
@@ -1609,10 +3137,20 @@ async function openMyProfile(){
         <button class="btn btn-d" onclick="disable2faMe()">Disattiva 2FA</button>
       `}
     </div>
+    <div style="background:var(--bg3);border-radius:9px;padding:16px;margin-bottom:16px">
+      <div style="font-size:11px;font-weight:700;margin-bottom:12px">✉ Email notifiche ticket</div>
+      <div class="form-row"><label class="form-label">Indirizzo email</label><input class="form-input" id="my-ticket-email" type="email" value="${allUsers.find(u=>u.id===currentUser.id)?.ticket_email||''}" placeholder="tuo@email.it"></div>
+      <button class="btn btn-g" onclick="saveMyTicketEmail()">Salva email</button>
+    </div>
     <div style="background:var(--bg3);border-radius:9px;padding:16px">
       <div style="font-size:11px;font-weight:700;margin-bottom:12px">🔑 Cambia Password</div>
       <div class="form-row"><label class="form-label">Nuova password</label><input class="form-input" id="new-pwd" type="password" placeholder="min. 6 caratteri"></div>
       <button class="btn btn-g" onclick="changeMyPassword()">Aggiorna Password</button>
+    </div>
+    <div style="background:var(--bg3);border-radius:9px;padding:16px;margin-top:16px">
+      <div style="font-size:11px;font-weight:700;margin-bottom:12px;display:flex;align-items:center;gap:8px">🔑 Passkey <span style="font-size:9px;font-weight:400;color:var(--text3);background:rgba(0,212,170,.1);border:1px solid rgba(0,212,170,.2);border-radius:4px;padding:1px 6px">FIDO2 / WebAuthn</span></div>
+      <div id="pk-list" style="margin-bottom:12px"><span style="font-size:11px;color:var(--text3)">Caricamento…</span></div>
+      <button class="btn btn-b" style="font-size:11px;padding:8px 14px" onclick="registerPasskey()">+ Aggiungi Passkey</button>
     </div>
   `);
   // Genera QR
@@ -1621,6 +3159,7 @@ async function openMyProfile(){
       try{new QRCode(document.getElementById('qr-canvas'),{text:d.uri,width:180,height:180,colorDark:'#00d4aa',colorLight:'#161b22'})}catch(e){}
     },100);
   }
+  loadPasskeys();
 }
 
 function eotpNext(i){const v=document.getElementById('eo'+i).value;if(v&&i<5)document.getElementById('eo'+(i+1)).focus()}
@@ -1640,6 +3179,14 @@ async function disable2faMe(){
   toast('2FA disattivato');currentUser.totp_enabled=false;closeModal();openMyProfile();
 }
 
+async function saveMyTicketEmail(){
+  const email=document.getElementById('my-ticket-email').value.trim();
+  await api(`/api/users/${currentUser.id}`,{method:'PATCH',body:JSON.stringify({ticket_email:email})});
+  await loadUsers();
+  toast('Email notifiche salvata!');
+}
+
+
 async function changeMyPassword(){
   const p=document.getElementById('new-pwd').value;
   if(p.length<6){toast('Password troppo corta','err');return}
@@ -1647,12 +3194,55 @@ async function changeMyPassword(){
   toast('Password aggiornata!');closeModal();
 }
 
+// ── Passkey helpers ──────────────────────────────────────────
+function _b64uToBuf(b){const p=b.replace(/-/g,'+').replace(/_/g,'/');const bin=atob(p);const buf=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)buf[i]=bin.charCodeAt(i);return buf.buffer}
+function _bufToB64u(buf){const bytes=new Uint8Array(buf);let s='';for(let i=0;i<bytes.byteLength;i++)s+=String.fromCharCode(bytes[i]);return btoa(s).replace(/[+]/g,'-').replace(/[/]/g,'_').replace(/=/g,'')}
+
+async function loadPasskeys(){
+  const el=document.getElementById('pk-list'); if(!el)return;
+  try{
+    const list=await api('/api/auth/passkeys');
+    if(!list.length){el.innerHTML='<p style="font-size:11px;color:var(--text2)">Nessuna passkey registrata.</p>';return}
+    el.innerHTML=list.map(pk=>`
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid rgba(255,255,255,.06)">
+        <div><div style="font-size:12px;font-weight:600">🔑 ${pk.name}</div><div style="font-size:10px;color:var(--text3);font-family:monospace">${pk.created_at.slice(0,10)}</div></div>
+        <button class="btn btn-d" style="font-size:10px;padding:4px 8px" onclick="deletePasskey('${pk.id}')">✕</button>
+      </div>`).join('');
+  }catch(e){el.innerHTML='<p style="font-size:11px;color:var(--red)">Errore caricamento passkey</p>'}
+}
+
+async function registerPasskey(){
+  if(!navigator.credentials){toast('WebAuthn non supportato da questo browser','err');return}
+  try{
+    const b=await api('/api/auth/passkey/register/begin',{method:'POST'});
+    if(b.error){toast(b.error,'err');return}
+    b.challenge=_b64uToBuf(b.challenge);
+    b.user.id=_b64uToBuf(b.user.id);
+    if(b.excludeCredentials)b.excludeCredentials=b.excludeCredentials.map(c=>({...c,id:_b64uToBuf(c.id)}));
+    const cred=await navigator.credentials.create({publicKey:b});
+    const name=prompt('Nome per questa passkey:','La mia Passkey')||'Passkey';
+    const payload={name,id:cred.id,rawId:_bufToB64u(cred.rawId),type:cred.type,response:{
+      attestationObject:_bufToB64u(cred.response.attestationObject),
+      clientDataJSON:_bufToB64u(cred.response.clientDataJSON)
+    }};
+    const r=await api('/api/auth/passkey/register/finish',{method:'POST',body:JSON.stringify(payload)});
+    if(r.ok){toast('Passkey registrata!');loadPasskeys();}
+    else toast(r.error||'Errore registrazione','err');
+  }catch(e){if(e.name!=='NotAllowedError')toast('Errore: '+e.message,'err')}
+}
+
+async function deletePasskey(id){
+  if(!confirm('Eliminare questa passkey?'))return;
+  await api(`/api/auth/passkeys/${id}`,{method:'DELETE'});
+  toast('Passkey eliminata');loadPasskeys();
+}
+
 // ── LOAD ─────────────────────────────────────────────────────
 async function refreshAll(){
   try{
-    await Promise.all([loadStats(),loadOrgs(),loadSites(),loadDepts(),loadMachines(),loadTickets()]);
+    await Promise.all([loadStats(),loadOrgs(),loadSites(),loadDepts(),loadMachines(),loadTickets(),loadInvites()]);
     if(currentUser?.role==='admin') await loadUsers();
-    renderTree(); renderOrgCards(); renderDevices(); renderTickets(); renderOverview(); renderUsers();
+    renderTree(); renderOrgCards(); renderDevices(); renderTickets(); renderOverview(); renderUsers(); updateTicketCounts();
     document.getElementById('clk').textContent=new Date().toLocaleTimeString('it-IT',{hour:'2-digit',minute:'2-digit'});
   }catch(e){}
 }
@@ -1671,8 +3261,92 @@ async function loadStats(){
 async function loadOrgs(){allOrgs=await api('/api/orgs');document.getElementById('nb-orgs').textContent=allOrgs.length}
 async function loadSites(){allSites=await api('/api/sites')}
 async function loadDepts(){allDepts=await api('/api/depts')}
-async function loadMachines(){allMachines=await api('/api/machines')}
+async function loadMachines(){
+  allMachines=await api('/api/machines');
+  window._machinesMap={};
+  allMachines.forEach(m=>window._machinesMap[m.id]=m);
+  startCountdownTick();
+}
 async function loadTickets(){allTickets=await api('/api/tickets')}
+
+let allInvites=[];
+async function loadInvites(){
+  allInvites=await api('/api/invites');
+  renderInvites();
+  renderOverviewInvites();
+  const n=allInvites.length;
+  const badge=document.getElementById('nb-invites');
+  if(n>0){badge.textContent=n;badge.style.display='inline-block';}
+  else{badge.style.display='none';}
+}
+
+function _inviteMinLeft(inv){
+  if(!inv.expires_at) return null;
+  const exp=new Date(inv.expires_at.replace(' ','T')+'Z');
+  const diff=Math.round((exp-Date.now())/60000);
+  return diff>0?diff:0;
+}
+
+function _inviteCard(inv, compact=false){
+  const min=_inviteMinLeft(inv);
+  const minLabel=min!==null?`<span style="font-size:10px;color:${min<10?'#e53935':'#f0a500'}">(scade tra ${min} min)</span>`:'';
+  const rdBlock=inv.rustdesk_id?`
+    <div style="margin-top:8px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <span style="font-size:11px;color:var(--text2)">ID: <b style="color:var(--green);letter-spacing:1px">${inv.rustdesk_id}</b></span>
+      <button class="btn btn-g" style="font-size:10px;padding:3px 8px" onclick="navigator.clipboard.writeText('${inv.rustdesk_id}');toast('ID copiato!')">⎘ Copia ID</button>
+      <span style="font-size:11px;color:var(--text2)">Pwd: <b style="color:#e67e22;letter-spacing:1px">${inv.rustdesk_pwd||'—'}</b></span>
+      <button class="btn btn-g" style="font-size:10px;padding:3px 8px" onclick="navigator.clipboard.writeText('${inv.rustdesk_pwd||''}');toast('Password copiata!')">⎘ Copia Pwd</button>
+    </div>`:'';
+  const connectBtn=inv.rustdesk_id?`<a href="rustdesk://connect/${inv.rustdesk_id}" class="btn btn-p" style="font-size:11px;padding:7px 14px;text-decoration:none" title="Apri RustDesk">🖥 Connetti</a>`:'';
+  if(compact) return `
+    <div style="background:var(--bg3);border-radius:8px;padding:12px 16px;margin-bottom:8px;display:flex;align-items:center;gap:12px;border:1px solid var(--border)">
+      <div style="font-size:22px">🖥️</div>
+      <div style="flex:1">
+        <div style="font-size:13px;font-weight:700;color:var(--text1)">${inv.pc_name} ${minLabel}</div>
+        <div style="font-size:10px;color:var(--text3)">${inv.created_at?.slice(0,16).replace('T',' ')||'—'}</div>
+      </div>
+      <button class="btn btn-d" style="font-size:10px;padding:5px 10px" onclick="dismissInvite(${inv.id})">✕</button>
+    </div>`;
+  return `
+    <div style="background:var(--bg2);border-radius:10px;padding:18px 22px;margin-bottom:12px;border:1px solid var(--border)">
+      <div style="display:flex;align-items:center;gap:14px">
+        <div style="font-size:30px">🖥️</div>
+        <div style="flex:1">
+          <div style="font-size:15px;font-weight:700;color:var(--text1)">${inv.pc_name} ${minLabel}</div>
+          <div style="font-size:11px;color:var(--text3);margin-top:2px">Ricevuto: ${inv.created_at?.slice(0,16).replace('T',' ')||'—'}</div>
+          ${rdBlock}
+        </div>
+        <div style="display:flex;flex-direction:column;gap:6px;align-items:flex-end">
+          ${connectBtn}
+          <button class="btn btn-d" style="font-size:11px;padding:7px 14px" onclick="dismissInvite(${inv.id})">✕ Chiudi</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+function renderInvites(){
+  const el=document.getElementById('invites-list');
+  if(!el)return;
+  if(!allInvites.length){
+    el.innerHTML='<div style="text-align:center;padding:48px;color:var(--text3);font-size:13px">Nessun invito in attesa</div>';
+    return;
+  }
+  el.innerHTML=allInvites.map(inv=>_inviteCard(inv,false)).join('');
+}
+
+function renderOverviewInvites(){
+  const panel=document.getElementById('ov-invites-panel');
+  const el=document.getElementById('ov-invites');
+  if(!panel||!el)return;
+  if(!allInvites.length){panel.style.display='none';return;}
+  panel.style.display='block';
+  el.innerHTML=allInvites.slice(0,5).map(inv=>_inviteCard(inv,true)).join('');
+}
+
+async function dismissInvite(id){
+  await api('/api/invites/'+id,{method:'DELETE'});
+  await loadInvites();
+}
 async function loadUsers(){try{allUsers=await api('/api/users')}catch(e){allUsers=[]}}
 
 // ── USERS VIEW ────────────────────────────────────────────────
@@ -1685,12 +3359,17 @@ function renderUsers(){
       <div class="user-avatar">${u.username[0].toUpperCase()}</div>
       <div style="flex:1">
         <div style="font-size:13px;font-weight:700">${u.username}</div>
-        <div style="font-size:10px;color:var(--text2);font-family:monospace">${u.created_at?.slice(0,10)||'—'}</div>
+        <div style="font-size:10px;color:var(--text2);font-family:monospace">${u.ticket_email||'<span style="color:var(--text3);font-style:italic">nessuna email ticket</span>'}</div>
+        <div style="font-size:10px;color:var(--text3);font-family:monospace">${u.created_at?.slice(0,10)||'—'}</div>
       </div>
       <span class="role-badge ${u.role==='admin'?'role-admin':'role-viewer'}">${u.role}</span>
       <span class="${u.totp_enabled?'totp-on':'totp-off'}">${u.totp_enabled?'🔐 2FA':'2FA off'}</span>
+      ${u.disabled?`<span style="font-size:9px;font-weight:700;color:#ff6b6b;background:rgba(255,107,107,.12);border:1px solid rgba(255,107,107,.3);border-radius:4px;padding:2px 6px">DISABILITATO</span>`:''}
       ${u.id!==currentUser?.id?`
         <button class="btn btn-b" style="font-size:10px;padding:5px 9px" onclick="openEditUser('${u.id}')">✏</button>
+        <button class="btn btn-b" style="font-size:10px;padding:5px 9px" title="Reimposta password" onclick="resetUserPassword('${u.id}','${u.username}')">🔑</button>
+        <button class="btn btn-b" style="font-size:10px;padding:5px 9px" title="Cambia ruolo" onclick="toggleUserRole('${u.id}','${u.role}')">${u.role==='admin'?'👑→👁':'👁→👑'}</button>
+        <button class="btn ${u.disabled?'btn-g':'btn-b'}" style="font-size:10px;padding:5px 9px" title="${u.disabled?'Abilita account':'Disabilita account'}" onclick="toggleUserDisabled('${u.id}',${u.disabled?0:1})">${u.disabled?'✅':'🚫'}</button>
         ${!u.totp_enabled?`<button class="btn btn-g" style="font-size:10px;padding:5px 9px" onclick="setup2faForUser('${u.id}','${u.username}')">🔐 Setup 2FA</button>`:`<button class="btn btn-d" style="font-size:10px;padding:5px 9px" onclick="disable2faAdmin('${u.id}')">Disattiva 2FA</button>`}
         <button class="btn btn-d" style="font-size:10px;padding:5px 9px" onclick="deleteUser('${u.id}')">✕</button>
       `:`<span style="font-size:10px;color:var(--text3);font-family:monospace">(tu)</span>`}
@@ -1750,6 +3429,37 @@ async function deleteUser(uid){
   const r=await api(`/api/users/${uid}`,{method:'DELETE'});
   if(r.error){toast(r.error,'err');return}
   toast('Utente eliminato'); await loadUsers(); renderUsers();
+}
+
+async function toggleUserRole(uid, currentRole){
+  const newRole=currentRole==='admin'?'viewer':'admin';
+  if(!confirm(`Cambiare ruolo a ${newRole}?`))return;
+  await api(`/api/users/${uid}`,{method:'PATCH',body:JSON.stringify({role:newRole})});
+  toast(`Ruolo cambiato in ${newRole}`);
+  await loadUsers(); renderUsers();
+}
+
+async function toggleUserDisabled(uid, disabled){
+  const msg=disabled?'Disabilitare questo account?':'Riabilitare questo account?';
+  if(!confirm(msg))return;
+  await api(`/api/users/${uid}`,{method:'PATCH',body:JSON.stringify({disabled})});
+  toast(disabled?'Account disabilitato':'Account riabilitato');
+  await loadUsers(); renderUsers();
+}
+
+function resetUserPassword(uid, username){
+  showModal(`Reimposta password — ${username}`,`
+    <div class="form-row"><label class="form-label">Nuova password</label><input class="form-input" id="f-rpwd" type="password" placeholder="min. 6 caratteri"></div>
+    <div class="form-actions">
+      <button class="btn btn-p" onclick="saveResetPassword('${uid}')">Reimposta</button>
+      <button class="btn btn-g" onclick="closeModal()">Annulla</button>
+    </div>`);
+}
+async function saveResetPassword(uid){
+  const pwd=document.getElementById('f-rpwd').value;
+  if(pwd.length<6){toast('Password troppo corta','err');return}
+  await api(`/api/users/${uid}`,{method:'PATCH',body:JSON.stringify({password:pwd})});
+  closeModal(); toast('Password reimpostata!');
 }
 
 async function setup2faForUser(uid, username){
@@ -1901,7 +3611,7 @@ function showOrgDetail(oid, sid=null, did=null){
         <button class="btn btn-b" onclick="openAssignModal('${oid}')">+ Assegna Device</button>
       </div>
       <table class="dev-table"><thead><tr>
-        <th>Device</th><th>Sede</th><th>Reparto</th><th>Risorse</th><th>RustDesk</th><th>Comandi</th><th></th>
+        <th>Device</th><th>Sede</th><th>Reparto</th><th>Risorse</th><th>RustDesk</th><th>Comandi</th><th>Agent</th><th></th>
       </tr></thead><tbody>
       ${filteredMachines.length?filteredMachines.map(m=>devRow(m,true)).join(''):`<tr><td colspan="6"><div class="empty"><div class="empty-icon">◉</div>Nessun device assegnato</div></td></tr>`}
       </tbody></table>
@@ -1917,8 +3627,9 @@ function devRow(m, inOrg=false){
   const dept=allDepts.find(d=>d.id===m.did);
   return`<tr style="cursor:pointer" onclick="openDeviceModal('${m.id}')" onmouseover="this.style.background='var(--bg3)'" onmouseout="this.style.background=''">
     <td><span class="dev-status ${m.status==='online'?'son':'sof'}"></span>
-      <span class="dev-name">${m.pc_name}</span><br>
-      <span class="dev-user">${m.user} · ${m.ip}</span>
+      <span class="dev-name">${m.pc_name}</span>
+      ${m.blocked?`<span style="font-size:9px;font-weight:700;color:#ff6b6b;background:rgba(255,107,107,.12);border:1px solid rgba(255,107,107,.3);border-radius:4px;padding:1px 5px;margin-left:5px">BLOCCATO</span>`:''}
+      <br><span class="dev-user">${m.user} · ${m.ip}</span>
     </td>
     ${!inOrg?`<td>${org?`<span class="tag tag-org" style="background:${org.color}22;color:${org.color};border-color:${org.color}44">${org.name}</span>`:`<span class="tag tag-none">—</span>`}</td>`:''}
     <td>${site?`<span class="tag tag-site">${site.name}</span>`:`<span class="tag tag-none">—</span>`}</td>
@@ -1930,12 +3641,36 @@ function devRow(m, inOrg=false){
         <div style="display:flex;align-items:center;gap:5px"><span style="font-size:9px;color:var(--text3);width:28px;font-family:monospace">DSK</span><div class="mini-bar"><div class="mf ${bc(m.disk)}" style="width:${m.disk}%"></div></div><span style="font-size:9px;color:var(--text2);font-family:monospace">${m.disk}%</span></div>
       </div>
     </td>
-    <td>${m.rustdesk_id?`<button class="btn btn-p" style="font-size:10px;padding:4px 9px" onclick="connectRD('${m.rustdesk_id}')">⬡ ${m.rustdesk_id}</button>`:`<span style="font-size:10px;color:var(--text3)">N/D</span>`}</td>
+    <td>
+      ${m.rd_active && m.rd_expires_at
+        ? `<div style="display:flex;flex-direction:column;align-items:center;gap:3px">
+             <span style="font-size:9px;color:#2ecc71;font-weight:bold;letter-spacing:1px">● ATTIVO</span>
+             <span id="cd-${m.id}" style="font-size:13px;font-weight:bold;font-family:monospace;color:#f0a500">${rdCountdown(m.rd_expires_at)}</span>
+             ${m.rd_temp_pwd ? `<button class="btn btn-g" style="font-size:9px;padding:2px 8px;margin-top:1px" onclick="event.stopPropagation();showRDModal('${m.rustdesk_id||''}','${m.rd_temp_pwd}','${m.id}')" title="Mostra ID e password">🔑 ID / PWD</button>` : ''}
+           </div>`
+        : m.rustdesk_id
+          ? `<span style="font-size:10px;color:var(--text3);font-family:monospace">${m.rustdesk_id}</span>`
+          : `<span style="font-size:10px;color:var(--text3)">N/D</span>`}
+    </td>
     <td>
       <div style="display:flex;gap:4px;flex-wrap:wrap">
-        <button class="btn btn-b" style="font-size:10px;padding:4px 8px" onclick="sendCommand('${m.id}','rustdesk')" title="Avvia RustDesk sul client">⬡ RustDesk</button>
+        ${m.rd_active
+          ? `<button class="btn" style="font-size:10px;padding:4px 8px;background:#c0392b;color:#fff" onclick="event.stopPropagation();sendCommand('${m.id}','rustdesk_stop')" title="Ferma RustDesk">✕ Disconnetti</button>`
+          : `<button class="btn btn-b" style="font-size:10px;padding:4px 8px" onclick="event.stopPropagation();askDurationAndConnect('${m.id}')" title="Connetti via RustDesk">⬡ Connetti</button>`}
         <button class="btn btn-d" style="font-size:10px;padding:4px 8px" onclick="sendCommand('${m.id}','reboot')" title="Riavvia il PC">↺ Riavvia</button>
+        ${(window._deployedVersion && m.agent_version && m.agent_version !== window._deployedVersion)
+          ? `<button class="btn" style="font-size:10px;padding:4px 8px;background:#f0a500;color:#000;font-weight:bold" onclick="event.stopPropagation();sendCommand('${m.id}','update')" title="Aggiorna agente a v${window._deployedVersion}">⬆ Aggiorna</button>`
+          : ''}
+        <button class="btn ${m.blocked?'btn-g':'btn-b'}" style="font-size:10px;padding:4px 8px" onclick="toggleBlockMachine('${m.id}',${m.blocked?0:1})" title="${m.blocked?'Sblocca device':'Blocca registrazione'}">${m.blocked?'🔓':'🔒'}</button>
+        <button class="btn btn-b" style="font-size:10px;padding:4px 8px;position:relative" onclick="event.stopPropagation();openChatModal('${m.id}','${m.pc_name}')" title="Apri chat con agente">💬${(_chatUnread[m.id]||0)>0?`<span style="position:absolute;top:-4px;right:-4px;background:#e74c3c;color:#fff;border-radius:50%;width:14px;height:14px;font-size:9px;display:flex;align-items:center;justify-content:center;font-weight:bold">${_chatUnread[m.id]}</span>`:''}</button>
+        <button class="btn btn-d" style="font-size:10px;padding:4px 8px" onclick="deleteMachine('${m.id}','${m.pc_name}')" title="Elimina device">✕</button>
       </div>
+    </td>
+    <td style="font-family:monospace;font-size:10px">
+      <span style="color:var(--text3)">${m.agent_version||'—'}</span>
+      ${(window._deployedVersion && m.agent_version && m.agent_version !== window._deployedVersion)
+        ? `<div><span style="font-size:9px;color:#f0a500;font-weight:bold">⬆ ${window._deployedVersion} disp.</span></div>`
+        : ''}
     </td>
     ${inOrg?`<td><button class="btn btn-g" style="font-size:10px;padding:4px 9px" onclick="openAssignDevice('${m.id}')">✏ Sposta</button></td>`:''}
   </tr>`;
@@ -1955,29 +3690,145 @@ function setDevFilter(f,el){devFilter=f;document.querySelectorAll('#view-devices
 function timeAgo(iso){const d=Date.now()-new Date(iso);const m=Math.floor(d/60000);if(m<1)return'Adesso';if(m<60)return`${m}m fa`;const h=Math.floor(m/60);if(h<24)return`${h}h fa`;return`${Math.floor(h/24)}g fa`}
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 function ticketHTML(t){
-  const pc=t.priority==='urgent'&&t.status==='open'?'pu':t.priority==='low'?'pl':'pn';
-  const badge=t.priority==='urgent'&&t.status==='open'?`<span class="tbadge bu">URGENTE</span>`:t.status==='open'?`<span class="tbadge bo">APERTO</span>`:`<span class="tbadge bc">CHIUSO</span>`;
-  return`<div class="titem" onclick="openTicket(${t.id})">
-    <div class="tpri ${pc}"></div>
-    <div style="flex:1;min-width:0">
-      <div class="ttitle">${esc(t.description)}</div>
-      <div class="tmeta"><span>🖥 ${t.pc_name}</span><span>👤 ${t.user}</span>${t.rustdesk_id?`<span style="color:var(--accent)">⬡ ${t.rustdesk_id}</span>`:''}<span>📡 ${t.ip}</span></div>
-    </div>
-    <div style="display:flex;flex-direction:column;align-items:flex-end;gap:5px">${badge}<span style="font-size:10px;color:var(--text3);font-family:monospace">${timeAgo(t.created_at)}</span></div>
-  </div>`;
+  const badge=t.priority==='urgent'&&t.status==='open'?`<span class="tbadge bu">URGENTE</span>`:t.status==='open'?`<span class="tbadge bo">APERTO</span>`:t.status==='deleted'?`<span class="tbadge bd">ELIMINATO</span>`:t.status==='archived'?`<span class="tbadge ba">ARCHIVIATO</span>`:`<span class="tbadge bc">CHIUSO</span>`;
+  const org=allOrgs.find(o=>o.id===t.org_id);
+  const dt=t.created_at?t.created_at.slice(0,10):'—';
+  const hr=t.created_at&&t.created_at.length>10?t.created_at.slice(11,16):'—';
+  const oggetto=t.oggetto||t.description||'—';
+  const machine=t.machine_id?allMachines.find(m=>m.id===t.machine_id):null;
+  const rdId=machine?.rustdesk_id||t.rustdesk_id||'';
+  const isOnline=machine?.status==='online';
+  const rdDirect=rdId?`<button class="btn btn-p" style="font-size:10px;padding:3px 8px;white-space:nowrap" onclick="event.stopPropagation();connectRD('${rdId}')">&#11045; Diretto</button>`:'';
+  const rdAgent=t.machine_id?`<button class="btn btn-b" style="font-size:10px;padding:3px 8px;white-space:nowrap" ${isOnline?'':'disabled title="Offline"'} onclick="event.stopPropagation();sendCommand('${t.machine_id}','rustdesk')">&#11045; Agent</button>`:'';
+  return`<tr style="cursor:pointer" onclick="openTicket(${t.id})" onmouseover="this.style.background='var(--bg3)'" onmouseout="this.style.background=''">
+    <td>${badge}</td>
+    <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px">${esc(oggetto)}</td>
+    <td style="font-size:11px">${org?`<span class="tag tag-org" style="background:${org.color}22;color:${org.color};border-color:${org.color}44">${org.name}</span>`:'<span style="color:var(--text3)">—</span>'}</td>
+    <td style="font-size:11px">${t.user||t.username||'—'}</td>
+    <td style="font-size:11px">${t.assigned_to||'<span style="color:var(--text3)">—</span>'}</td>
+    <td style="font-size:11px">${t.origin||'—'}</td>
+    <td style="font-size:11px;font-family:monospace">${dt}</td>
+    <td style="font-size:11px;font-family:monospace">${hr}</td>
+    <td onclick="event.stopPropagation()"><div style="display:flex;gap:4px">${rdDirect}${rdAgent}</div></td>
+  </tr>`;
 }
 function renderTickets(){
   const q=document.getElementById('t-search').value.toLowerCase();
   const list=allTickets.filter(t=>{
     if(tFilter==='open'&&t.status!=='open')return false;
     if(tFilter==='closed'&&t.status!=='closed')return false;
+    if(tFilter==='deleted'&&t.status!=='deleted')return false;
+    if(tFilter==='archived'&&t.status!=='archived')return false;
+    if(tFilter==='unassigned'&&(t.note&&t.note.trim()!==''))return false;
+    if(tFilter==='mine'&&t.username!==currentUser?.username)return false;
+    if(tFilter==='email')return false;
     return !q||`${t.pc_name} ${t.user} ${t.description}`.toLowerCase().includes(q);
   });
   document.getElementById('t-list').innerHTML=list.length?list.map(ticketHTML).join(''):`<div class="empty"><div class="empty-icon">◈</div>Nessun ticket trovato</div>`;
+  updateTicketCounts();
 }
 function setTFilter(f,el){tFilter=f;document.querySelectorAll('#view-tickets .tab').forEach(t=>t.classList.remove('active'));el.classList.add('active');renderTickets()}
+
+function toggleTicketMenu(el){
+  const sub=document.getElementById('nav-ticket-sub');
+  const arrow=document.getElementById('nav-ticket-arrow');
+  const isOpen=sub.classList.contains('open');
+  sub.classList.toggle('open',!isOpen);
+  arrow.textContent=isOpen?'▶':'▼';
+  if(!isOpen){showView('tickets',null);setTicketView('all',document.querySelector('#nav-ticket-sub .nav-sub-item.active'))}
+}
+
+function toggleSettingsMenu(el){
+  const sub=document.getElementById('nav-settings-sub');
+  const arrow=document.getElementById('nav-settings-arrow');
+  const isOpen=sub.classList.contains('open');
+  sub.classList.toggle('open',!isOpen);
+  arrow.textContent=isOpen?'▶':'▼';
+  if(!isOpen) showView('settings-mail', document.querySelector('#nav-settings-sub .nav-sub-item'));
+}
+
+async function loadMailSettings(){
+  try{
+    const d=await api('/api/settings/mail');
+    if(d.smtp_host) document.getElementById('smtp-host').value=d.smtp_host;
+    if(d.smtp_port) document.getElementById('smtp-port').value=d.smtp_port;
+    if(d.smtp_user) document.getElementById('smtp-user').value=d.smtp_user;
+    if(d.smtp_from) document.getElementById('smtp-from').value=d.smtp_from;
+    document.getElementById('smtp-ssl').checked = d.smtp_ssl !== '0';
+    if(d.smtp_password_set) document.getElementById('smtp-password').placeholder='● password salvata (lascia vuoto per non cambiare)';
+  }catch(e){}
+}
+
+async function saveMailSettings(){
+  const body={
+    smtp_host: document.getElementById('smtp-host').value.trim(),
+    smtp_port: document.getElementById('smtp-port').value.trim()||'465',
+    smtp_user: document.getElementById('smtp-user').value.trim(),
+    smtp_password: document.getElementById('smtp-password').value,
+    smtp_from: document.getElementById('smtp-from').value.trim(),
+    smtp_ssl: document.getElementById('smtp-ssl').checked?'1':'0',
+  };
+  if(!body.smtp_host||!body.smtp_user){toast('Host e utente SMTP obbligatori','err');return}
+  try{await api('/api/settings/mail',{method:'POST',body:JSON.stringify(body)});toast('Impostazioni salvate!');}
+  catch(e){toast('Errore salvataggio','err');}
+}
+
+async function sendTestMail(){
+  const to=document.getElementById('smtp-test-to').value.trim();
+  const res=document.getElementById('smtp-test-result');
+  if(!to){toast('Inserisci un indirizzo email di test','err');return}
+  res.innerHTML='<span style="color:var(--text2)">Invio in corso...</span>';
+  try{
+    const d=await api('/api/settings/mail/test',{method:'POST',body:JSON.stringify({to})});
+    if(d.ok) res.innerHTML='<span style="color:var(--accent)">✅ Email inviata con successo a '+to+'</span>';
+    else res.innerHTML='<span style="color:var(--red)">❌ '+d.error+'</span>';
+  }catch(e){res.innerHTML='<span style="color:var(--red)">❌ Errore di rete</span>';}
+}
+
+function setTicketView(filter, el){
+  document.querySelectorAll('.nav-sub-item').forEach(i=>i.classList.remove('active'));
+  if(el) el.classList.add('active');
+  if(filter==='new'){openNewTicket();return}
+  showView('tickets',null);
+  tFilter=filter;
+  renderTickets();
+  updateTicketCounts();
+}
+
+function updateTicketCounts(){
+  const total=allTickets.length;
+  const open=allTickets.filter(t=>t.status==='open').length;
+  const deleted=allTickets.filter(t=>t.status==='deleted').length;
+  const archived=allTickets.filter(t=>t.status==='archived').length;
+  const unassigned=allTickets.filter(t=>!t.assigned_to||t.assigned_to.trim()==='').length;
+  const mine=allTickets.filter(t=>t.assigned_to===currentUser?.username).length;
+  document.getElementById('nb-t').textContent=open||0;
+  document.getElementById('ns-all').textContent=total;
+  document.getElementById('ns-open').textContent=open;
+  document.getElementById('ns-deleted').textContent=deleted;
+  document.getElementById('ns-archived').textContent=archived;
+  document.getElementById('ns-unassigned').textContent=unassigned;
+  document.getElementById('ns-mine').textContent=mine;
+  document.getElementById('ns-email').textContent=0;
+}
+function ticketCardHTML(t){
+  const badge=t.priority==='urgent'&&t.status==='open'?`<span class="tbadge bu">URGENTE</span>`:t.status==='open'?`<span class="tbadge bo">APERTO</span>`:t.status==='deleted'?`<span class="tbadge bd">ELIMINATO</span>`:t.status==='archived'?`<span class="tbadge ba">ARCHIVIATO</span>`:`<span class="tbadge bc">CHIUSO</span>`;
+  const oggetto=t.oggetto||t.description||'—';
+  const machine=t.machine_id?allMachines.find(m=>m.id===t.machine_id):null;
+  const rdId=machine?.rustdesk_id||t.rustdesk_id||'';
+  const isOnline=machine?.status==='online';
+  const rdDirect=rdId?`<button class="btn btn-p" style="font-size:10px;padding:3px 8px;white-space:nowrap" onclick="event.stopPropagation();connectRD('${rdId}')">&#11045; Diretto</button>`:'';
+  const rdAgent=t.machine_id?`<button class="btn btn-b" style="font-size:10px;padding:3px 8px;white-space:nowrap" ${isOnline?'':'disabled title="Offline"'} onclick="event.stopPropagation();sendCommand('${t.machine_id}','rustdesk')">&#11045; Agent</button>`:'';
+  return`<div style="display:flex;align-items:center;gap:10px;padding:10px 16px;border-bottom:1px solid rgba(42,53,71,.4);cursor:pointer;transition:background .2s" onclick="openTicket(${t.id})" onmouseover="this.style.background='var(--bg3)'" onmouseout="this.style.background=''">
+    <div style="flex:1;min-width:0">
+      <div style="font-size:12px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(oggetto)}</div>
+      <div style="font-size:10px;color:var(--text3);font-family:monospace">#${t.id} · ${t.user||t.username||'—'}</div>
+    </div>
+    <div style="display:flex;gap:4px;align-items:center">${rdDirect}${rdAgent}${badge}</div>
+  </div>`;
+}
 function renderOverview(){
-  document.getElementById('ov-tickets').innerHTML=allTickets.slice(0,6).map(ticketHTML).join('')||`<div class="empty"><div class="empty-icon">◈</div>Nessun ticket</div>`;
+  document.getElementById('ov-tickets').innerHTML=allTickets.slice(0,6).map(ticketCardHTML).join('')||`<div class="empty"><div class="empty-icon">◈</div>Nessun ticket</div>`;
   document.getElementById('ov-devices').innerHTML=allMachines.slice(0,6).map(m=>`
     <div style="display:flex;align-items:center;gap:10px;padding:10px 16px;border-bottom:1px solid rgba(42,53,71,.4);cursor:pointer;transition:background .2s" onclick="showView('devices',null)" onmouseover="this.style.background='var(--bg3)'" onmouseout="this.style.background=''">
       <div class="dev-status ${m.status==='online'?'son':'sof'}"></div>
@@ -2026,27 +3877,208 @@ async function saveAssign(){const mid=document.getElementById('f-mid').value;con
 
 async function openTicket(id){
   const t=await api(`/api/ticket/${id}`);
-  const badge=t.priority==='urgent'&&t.status==='open'?`<span class="tbadge bu">URGENTE</span>`:t.status==='open'?`<span class="tbadge bo">APERTO</span>`:`<span class="tbadge bc">CHIUSO</span>`;
-  showModal(`Ticket #${t.id} — ${t.pc_name}`,`
-    <div class="igrid">
-      <div class="iitem"><div class="ilabel">Nome PC</div><div class="ivalue">${t.pc_name}</div></div>
-      <div class="iitem"><div class="ilabel">Utente</div><div class="ivalue">${t.user}</div></div>
-      <div class="iitem"><div class="ilabel">IP</div><div class="ivalue">${t.ip}</div></div>
-      <div class="iitem"><div class="ilabel">Stato</div><div class="ivalue">${badge}</div></div>
+  const badge=t.priority==='urgent'&&t.status==='open'?`<span class="tbadge bu">URGENTE</span>`:t.status==='open'?`<span class="tbadge bo">APERTO</span>`:t.status==='archived'?`<span class="tbadge ba">ARCHIVIATO</span>`:t.status==='deleted'?`<span class="tbadge bd">ELIMINATO</span>`:`<span class="tbadge bc">CHIUSO</span>`;
+  const orgOpts=allOrgs.map(o=>`<option value="${o.id}"${t.org_id===o.id?' selected':''}>${esc(o.name)}</option>`).join('');
+  const userOpts=allUsers.map(u=>`<option value="${esc(u.username)}"${t.assigned_to===u.username?' selected':''}>${esc(u.username)}</option>`).join('');
+  const machine=allMachines.find(m=>m.id===t.machine_id);
+  const rdId=machine?.rustdesk_id||t.rustdesk_id||'';
+  const mid=t.machine_id||'';
+  const isOnline=machine?.status==='online';
+  const rdBar=mid?`<div style="display:flex;align-items:center;gap:12px;background:var(--bg3);border-radius:8px;padding:10px 14px;margin-bottom:14px;border:1px solid var(--border)">
+    <div style="flex:1">
+      <div style="font-size:9px;color:var(--text3);letter-spacing:1px;text-transform:uppercase;font-family:monospace;margin-bottom:2px">Device</div>
+      <div style="font-size:13px;font-weight:600">${esc(t.pc_name||'—')}</div>
+      <div style="font-size:10px;color:var(--text3);font-family:monospace">${t.ip||''}</div>
     </div>
-    ${t.rustdesk_id?`<div class="rdbox"><div><div style="font-size:9px;color:var(--text2);margin-bottom:3px;letter-spacing:1px">RUSTDESK ID</div><div class="rdid">${t.rustdesk_id}</div></div><button class="btn btn-p" onclick="connectRD('${t.rustdesk_id}')">⬡ Connetti</button></div>`:''}
-    <div style="font-size:10px;color:var(--text2);margin-bottom:6px;letter-spacing:1px;text-transform:uppercase;font-family:monospace">Descrizione</div>
-    <div style="background:var(--bg3);border-radius:7px;padding:12px;font-size:12px;line-height:1.6;margin-bottom:16px;white-space:pre-wrap">${esc(t.description)}</div>
-    ${t.screenshot?`<div style="background:var(--bg0);border-radius:7px;overflow:hidden;border:1px solid var(--border);margin-bottom:16px"><img src="data:image/png;base64,${t.screenshot}" style="max-width:100%;max-height:300px;display:block;margin:auto"></div>`:''}
-    <textarea class="note-area" id="note-inp" placeholder="Note tecnico...">${t.note||''}</textarea>
+    <div style="display:flex;gap:8px;align-items:center">
+      ${rdId?`<button class="btn btn-p" onclick="connectRD('${rdId}')">&#11045; Connetti diretto</button>`:''}
+      <button class="btn btn-b" ${isOnline?'':'disabled title="Device offline"'} onclick="closeModal();sendCommand('${mid}','rustdesk')">&#11045; Connetti via Agent</button>
+    </div>
+  </div>`:'';
+  showModal(`Ticket #${t.id}`,`
+    ${rdBar}
+    <div class="igrid" style="margin-bottom:14px">
+      <div class="iitem"><div class="ilabel">Stato</div><div class="ivalue">${badge}</div></div>
+      <div class="iitem"><div class="ilabel">ID</div><div class="ivalue" style="font-family:monospace">#${t.id}</div></div>
+      <div class="iitem"><div class="ilabel">Nome PC</div><div class="ivalue">${esc(t.pc_name||'—')}</div></div>
+      <div class="iitem"><div class="ilabel">Richiedente</div><div class="ivalue">${esc(t.user||'—')}</div></div>
+      <div class="iitem"><div class="ilabel">IP</div><div class="ivalue" style="font-family:monospace">${esc(t.ip||'—')}</div></div>
+      <div class="iitem"><div class="ilabel">Creato</div><div class="ivalue">${t.created_at?t.created_at.slice(0,16).replace('T',' '):'—'}</div></div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px">
+      <div style="grid-column:1/-1">
+        <div class="ilabel" style="margin-bottom:4px">Oggetto</div>
+        <input class="note-area" id="tk-oggetto" style="height:36px;padding:6px 10px" value="${esc(t.oggetto||'')}">
+      </div>
+      <div>
+        <div class="ilabel" style="margin-bottom:4px">Stato</div>
+        <select class="note-area" id="tk-status" style="height:36px;padding:6px 8px">
+          <option value="open"${(t.status||'open')==='open'?' selected':''}>Aperto</option>
+          <option value="closed"${t.status==='closed'?' selected':''}>Chiuso</option>
+          <option value="archived"${t.status==='archived'?' selected':''}>Archiviato</option>
+          <option value="deleted"${t.status==='deleted'?' selected':''}>Eliminato</option>
+        </select>
+      </div>
+      <div>
+        <div class="ilabel" style="margin-bottom:4px">Organizzazione</div>
+        <select class="note-area" id="tk-org" style="height:36px;padding:6px 8px">
+          <option value="">— Nessuna —</option>${orgOpts}
+        </select>
+      </div>
+      <div>
+        <div class="ilabel" style="margin-bottom:4px">Assegnatario primario</div>
+        <select class="note-area" id="tk-assigned" style="height:36px;padding:6px 8px">
+          <option value="">— Non assegnato —</option>${userOpts}
+        </select>
+      </div>
+      <div>
+        <div class="ilabel" style="margin-bottom:4px">Tipo</div>
+        <select class="note-area" id="tk-type" style="height:36px;padding:6px 8px">
+          <option value="Incidente"${(t.type||'Incidente')==='Incidente'?' selected':''}>Incidente</option>
+          <option value="Richiesta"${t.type==='Richiesta'?' selected':''}>Richiesta</option>
+          <option value="Problema"${t.type==='Problema'?' selected':''}>Problema</option>
+          <option value="Manutenzione"${t.type==='Manutenzione'?' selected':''}>Manutenzione</option>
+        </select>
+      </div>
+      <div>
+        <div class="ilabel" style="margin-bottom:4px">Origine</div>
+        <select class="note-area" id="tk-origin" style="height:36px;padding:6px 8px">
+          <option value="Agent"${(t.origin||'Agent')==='Agent'?' selected':''}>Agent</option>
+          <option value="Email"${t.origin==='Email'?' selected':''}>Email</option>
+          <option value="Telefono"${t.origin==='Telefono'?' selected':''}>Telefono</option>
+          <option value="Portale"${t.origin==='Portale'?' selected':''}>Portale</option>
+          <option value="Manuale"${t.origin==='Manuale'?' selected':''}>Manuale</option>
+        </select>
+      </div>
+    </div>
+    ${t.description?`<div class="ilabel" style="margin-bottom:4px">Descrizione</div><div style="background:var(--bg3);border-radius:7px;padding:10px 12px;font-size:12px;line-height:1.6;margin-bottom:12px;white-space:pre-wrap">${esc(t.description)}</div>`:''}
+    ${t.screenshot?`<div style="background:var(--bg0);border-radius:7px;overflow:hidden;border:1px solid var(--border);margin-bottom:12px"><img src="data:image/png;base64,${t.screenshot}" style="max-width:100%;max-height:250px;display:block;margin:auto"></div>`:''}
+    <div class="ilabel" style="margin-bottom:4px">Note tecnico</div>
+    <textarea class="note-area" id="note-inp" placeholder="Note tecnico..." style="margin-bottom:14px">${t.note||''}</textarea>
     <div style="display:flex;gap:8px;flex-wrap:wrap">
-      ${t.status==='open'?`<button class="btn btn-p" onclick="updTicket(${t.id},'status','closed')">✓ Chiudi</button><button class="btn btn-d" onclick="updTicket(${t.id},'priority','urgent')">⚠ Urgente</button>`:`<button class="btn btn-g" onclick="updTicket(${t.id},'status','open')">↺ Riapri</button>`}
-      <button class="btn btn-g" onclick="saveNote(${t.id})">💾 Salva Note</button>
-      <button class="btn btn-g" onclick="closeModal()">Chiudi</button>
+      <button class="btn btn-p" onclick="saveTicketFields(${t.id})">Salva</button>
+      <button class="btn" style="background:#1a2a1a;color:#2ebd6b;border:1px solid #2ebd6b44" onclick="archiveTicket(${t.id})">⊘ Archivia</button>
+      <button class="btn btn-d" onclick="softDeleteTicket(${t.id})">✕ Elimina</button>
+      <button class="btn" style="background:#2a1010;color:#e05c5c;border:1px solid #e05c5c33;font-size:10px" onclick="hardDeleteTicket(${t.id})">⚠ Elimina definitivamente</button>
+      <button class="btn btn-g" onclick="closeModal()">Annulla</button>
     </div>`);
+}
+async function saveTicketFields(id){
+  const body={
+    status:document.getElementById('tk-status').value,
+    oggetto:document.getElementById('tk-oggetto').value,
+    org_id:document.getElementById('tk-org').value||null,
+    assigned_to:document.getElementById('tk-assigned').value||null,
+    type:document.getElementById('tk-type').value,
+    origin:document.getElementById('tk-origin').value,
+    note:document.getElementById('note-inp').value
+  };
+  await api(`/api/ticket/${id}`,{method:'PATCH',body:JSON.stringify(body)});
+  closeModal();toast('Ticket salvato');refreshAll();
+}
+async function archiveTicket(id){
+  await api(`/api/ticket/${id}`,{method:'PATCH',body:JSON.stringify({status:'archived'})});
+  closeModal();toast('Ticket archiviato');refreshAll();
+}
+async function softDeleteTicket(id){
+  if(!confirm('Spostare il ticket nel cestino?'))return;
+  await api(`/api/ticket/${id}`,{method:'PATCH',body:JSON.stringify({status:'deleted'})});
+  closeModal();toast('Ticket eliminato');refreshAll();
+}
+async function hardDeleteTicket(id){
+  if(!confirm('Eliminare definitivamente il ticket? Questa azione non può essere annullata.'))return;
+  await api(`/api/ticket/${id}`,{method:'DELETE'});
+  closeModal();toast('Ticket eliminato definitivamente');refreshAll();
+}
+function openNewTicket(){
+  const orgOpts=allOrgs.map(o=>`<option value="${o.id}">${esc(o.name)}</option>`).join('');
+  const userOpts=allUsers.map(u=>`<option value="${esc(u.username)}">${esc(u.username)}</option>`).join('');
+  showModal('Nuovo Ticket',`
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px">
+      <div style="grid-column:1/-1">
+        <div class="ilabel" style="margin-bottom:4px">Oggetto *</div>
+        <input class="note-area" id="nt-oggetto" style="height:36px;padding:6px 10px" placeholder="Oggetto del ticket">
+      </div>
+      <div>
+        <div class="ilabel" style="margin-bottom:4px">Organizzazione</div>
+        <select class="note-area" id="nt-org" style="height:36px;padding:6px 8px">
+          <option value="">— Nessuna —</option>${orgOpts}
+        </select>
+      </div>
+      <div>
+        <div class="ilabel" style="margin-bottom:4px">Richiedente</div>
+        <input class="note-area" id="nt-user" style="height:36px;padding:6px 10px" placeholder="Nome utente">
+      </div>
+      <div>
+        <div class="ilabel" style="margin-bottom:4px">Assegnatario primario</div>
+        <select class="note-area" id="nt-assigned" style="height:36px;padding:6px 8px">
+          <option value="">— Non assegnato —</option>${userOpts}
+        </select>
+      </div>
+      <div>
+        <div class="ilabel" style="margin-bottom:4px">Tipo</div>
+        <select class="note-area" id="nt-type" style="height:36px;padding:6px 8px">
+          <option value="Incidente">Incidente</option>
+          <option value="Richiesta">Richiesta</option>
+          <option value="Problema">Problema</option>
+          <option value="Manutenzione">Manutenzione</option>
+        </select>
+      </div>
+      <div>
+        <div class="ilabel" style="margin-bottom:4px">Origine</div>
+        <select class="note-area" id="nt-origin" style="height:36px;padding:6px 8px">
+          <option value="Manuale">Manuale</option>
+          <option value="Email">Email</option>
+          <option value="Telefono">Telefono</option>
+          <option value="Portale">Portale</option>
+          <option value="Agent">Agent</option>
+        </select>
+      </div>
+    </div>
+    <div class="ilabel" style="margin-bottom:4px">Descrizione</div>
+    <textarea class="note-area" id="nt-desc" placeholder="Descrizione del problema..." style="margin-bottom:14px;height:80px"></textarea>
+    <div style="display:flex;gap:8px">
+      <button class="btn btn-p" onclick="submitNewTicket()">Crea Ticket</button>
+      <button class="btn btn-g" onclick="closeModal()">Annulla</button>
+    </div>`);
+}
+async function submitNewTicket(){
+  const oggetto=document.getElementById('nt-oggetto').value.trim();
+  if(!oggetto){toast('Inserisci un oggetto');return;}
+  const body={
+    pc_name:'—', domain:'manuale',
+    user:document.getElementById('nt-user').value||'',
+    description:document.getElementById('nt-desc').value||'',
+    priority:'normal'
+  };
+  const res=await api('/api/ticket',{method:'POST',body:JSON.stringify(body)});
+  if(res.ticket_id){
+    const patch={
+      oggetto,
+      org_id:document.getElementById('nt-org').value||null,
+      assigned_to:document.getElementById('nt-assigned').value||null,
+      type:document.getElementById('nt-type').value,
+      origin:document.getElementById('nt-origin').value
+    };
+    await api(`/api/ticket/${res.ticket_id}`,{method:'PATCH',body:JSON.stringify(patch)});
+  }
+  closeModal();toast('Ticket creato');refreshAll();
 }
 async function updTicket(id,f,v){await api(`/api/ticket/${id}`,{method:'PATCH',body:JSON.stringify({[f]:v})});closeModal();toast('Ticket aggiornato');refreshAll()}
 async function saveNote(id){await api(`/api/ticket/${id}`,{method:'PATCH',body:JSON.stringify({note:document.getElementById('note-inp').value})});toast('Note salvate')}
+async function deleteMachine(mid, name){
+  if(!confirm(`Eliminare il device "${name}"?`))return;
+  await api(`/api/machines/${mid}`,{method:'DELETE'});
+  toast('Device eliminato');
+  await loadMachines(); renderDevices();
+}
+async function toggleBlockMachine(mid, blocked){
+  const msg=blocked?`Bloccare questo device? Non potrà più registrarsi.`:`Sbloccare questo device?`;
+  if(!confirm(msg))return;
+  await api(`/api/machines/${mid}/block`,{method:'PATCH',body:JSON.stringify({blocked})});
+  toast(blocked?'Device bloccato':'Device sbloccato');
+  await loadMachines(); renderDevices();
+}
 function connectRD(id){window.open(`rustdesk://${id}`,'_blank');toast(`Connessione RustDesk → ${id}`)}
 function openDeviceModal(mid){
   const m=allMachines.find(x=>x.id===mid);
@@ -2061,10 +4093,19 @@ function openDeviceModal(mid){
   const bar=v=>`<div style="display:flex;align-items:center;gap:8px"><div style="flex:1;height:5px;background:var(--bg0);border-radius:3px"><div style="width:${v}%;height:100%;border-radius:3px;background:${v>=85?'#e05c5c':v>=60?'#f0a500':'#2ebd6b'}"></div></div><span style="font-size:11px;color:var(--text2);font-family:monospace;width:32px">${v}%</span></div>`;
   const ago=t=>{const d=Date.now()-new Date(t);const mn=Math.floor(d/60000);if(mn<1)return'Adesso';if(mn<60)return mn+'m fa';const h=Math.floor(mn/60);if(h<24)return h+'h fa';return Math.floor(h/24)+'g fa';};
   const dis=online?'':'disabled title="Device offline"';
-  const rdBox=m.rustdesk_id
+  const isPfsense=m.device_type==='pfsense';
+  const rdBox=m.rustdesk_id&&!isPfsense
     ?`<div class="rdbox" style="margin-bottom:16px"><div><div style="font-size:9px;color:var(--text2);margin-bottom:3px;letter-spacing:1px">RUSTDESK ID</div><div class="rdid">${m.rustdesk_id}</div></div><button class="btn btn-p" onclick="connectRD('${m.rustdesk_id}')">&#11045; Connetti ora</button></div>`
     :'';
-  showModal(`&#128187; ${m.pc_name}`,`
+  let pfMeta='';
+  if(isPfsense&&m.meta){try{const mt=JSON.parse(m.meta);pfMeta=`<div style="background:var(--bg3);border-radius:9px;padding:10px 12px;margin-bottom:16px;font-size:11px;font-family:monospace;color:var(--text2);display:flex;flex-wrap:wrap;gap:8px 20px"><span>WAN <b style="color:var(--text1)">${mt.wan_ip||'—'}</b></span><span>OpenVPN <b style="color:var(--text1)">${mt.openvpn_tunnels||'—'}</b></span><span>IPsec <b style="color:var(--text1)">${mt.ipsec_tunnels||'—'}</b></span><span>DHCP leases <b style="color:var(--text1)">${mt.dhcp_leases!=null?mt.dhcp_leases:'—'}</b></span><span>Gateway <b style="color:${mt.gateway_status==='up'?'#2ebd6b':'#e05c5c'}">${mt.gateway_status||'—'}</b></span></div>`;}catch(e){}}
+  const cmdBtns=isPfsense
+    ?`<button class="btn btn-g" onclick="event.stopPropagation();sendCommand('${m.id}','backup_config')" ${dis}>&#128190; Backup</button>
+       <button class="btn" style="background:#4a4a6a;color:#fff" onclick="event.stopPropagation();sendCommand('${m.id}','restart_interface')" ${dis}>&#8635; WAN</button>
+       <button class="btn btn-d" onclick="event.stopPropagation();sendCommand('${m.id}','reboot')" ${dis}>&#8634; Riavvia</button>`
+    :`<button class="btn btn-b" onclick="event.stopPropagation();sendCommand('${m.id}','rustdesk')" ${dis}>&#11045; Connetti</button>
+      <button class="btn btn-d" onclick="event.stopPropagation();sendCommand('${m.id}','reboot')" ${dis}>&#8634; Riavvia PC</button>`;
+  showModal(`${isPfsense?'&#128442;':'&#128187;'} ${m.pc_name}`,`
     <div style="margin-bottom:16px">${statusBadge}</div>
     <div class="igrid" style="margin-bottom:16px">
       <div class="iitem"><div class="ilabel">Utente</div><div class="ivalue">${m.user||'&mdash;'}</div></div>
@@ -2075,6 +4116,7 @@ function openDeviceModal(mid){
       <div class="iitem"><div class="ilabel">Sede</div><div class="ivalue">${site?site.name:'&mdash;'}</div></div>
       <div class="iitem"><div class="ilabel">Reparto</div><div class="ivalue">${dept?dept.name:'&mdash;'}</div></div>
       <div class="iitem"><div class="ilabel">Ultimo contatto</div><div class="ivalue">${ago(m.last_seen)}</div></div>
+      <div class="iitem"><div class="ilabel">Agent</div><div class="ivalue" style="font-family:monospace">${m.agent_version||'—'}</div></div>
     </div>
     <div style="background:var(--bg3);border-radius:9px;padding:12px;margin-bottom:16px">
       <div style="font-size:10px;color:var(--text2);letter-spacing:1px;text-transform:uppercase;font-family:monospace;margin-bottom:10px">Risorse</div>
@@ -2084,15 +4126,66 @@ function openDeviceModal(mid){
         <div style="display:flex;align-items:center;gap:10px"><span style="font-size:10px;color:var(--text3);font-family:monospace;width:32px">DSK</span>${bar(m.disk)}</div>
       </div>
     </div>
+    ${pfMeta}
     ${rdBox}
     <div style="font-size:10px;color:var(--text2);letter-spacing:1px;text-transform:uppercase;font-family:monospace;margin-bottom:10px">Comandi remoti</div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px">
-      <button class="btn btn-b" onclick="sendCommand('${m.id}','rustdesk')" ${dis}>&#11045; Avvia RustDesk</button>
-      <button class="btn btn-d" onclick="sendCommand('${m.id}','reboot')" ${dis}>&#8634; Riavvia PC</button>
+      ${cmdBtns}
     </div>
     <div style="display:flex;gap:8px">
       <button class="btn btn-g" onclick="closeModal()">Chiudi</button>
     </div>`);
+}
+
+
+function rdCountdown(expiresAt){
+  if(!expiresAt) return '--:--';
+  const diff = Math.max(0, Math.floor((new Date(expiresAt)-Date.now())/1000));
+  const h=Math.floor(diff/3600), m=Math.floor((diff%3600)/60), s=diff%60;
+  if(h>0) return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+  return `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+}
+
+// Aggiorna countdown ogni secondo e auto-disconnette allo scadere
+let _cdInterval=null;
+function startCountdownTick(){
+  if(_cdInterval) clearInterval(_cdInterval);
+  _cdInterval=setInterval(()=>{
+    document.querySelectorAll('[id^="cd-"]').forEach(el=>{
+      const mid=el.id.replace('cd-','');
+      const m=window._machinesMap&&window._machinesMap[mid];
+      if(!m||!m.rd_expires_at){el.textContent='--:--';return;}
+      const diff=Math.max(0,Math.floor((new Date(m.rd_expires_at)-Date.now())/1000));
+      if(diff<=0){
+        el.textContent='00:00';
+        sendCommand(mid,'rustdesk_stop');
+        return;
+      }
+      const h=Math.floor(diff/3600),mn=Math.floor((diff%3600)/60),s=diff%60;
+      el.textContent=h>0?`${h}:${String(mn).padStart(2,'0')}:${String(s).padStart(2,'0')}`:`${String(mn).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+    });
+  },1000);
+}
+
+function askDurationAndConnect(mid){
+  const opts=[
+    {label:'30 minuti',val:30},{label:'1 ora',val:60},{label:'2 ore',val:120},
+    {label:'4 ore',val:240},{label:'8 ore',val:480},{label:'24 ore',val:1440}
+  ];
+  const btns=opts.map(o=>`<button class="btn btn-b" style="min-width:100px" onclick="closeModal();sendCommandDuration('${mid}','rustdesk',${o.val})">${o.label}</button>`).join('');
+  showModal('⏱ Durata connessione',`
+    <p style="color:var(--text2);margin-bottom:16px">Per quanto tempo vuoi restare connesso?</p>
+    <div style="display:flex;flex-wrap:wrap;gap:10px;justify-content:center">${btns}</div>
+  `);
+}
+
+async function sendCommandDuration(mid, cmd, duration){
+  try{
+    const d=await api(`/api/machines/${mid}/command`,{method:'POST',body:JSON.stringify({command:cmd,duration})});
+    if(!d.ok){toast(`✗ Errore: ${d.error||'sconosciuto'}`);return;}
+    toast('⏳ Avvio RustDesk sul client — attendo...');
+    await pollRDSession(mid);
+  }catch(e){toast('✗ Errore di rete')}
 }
 
 async function sendCommand(mid, cmd){
@@ -2101,8 +4194,14 @@ async function sendCommand(mid, cmd){
     const d=await api(`/api/machines/${mid}/command`,{method:'POST',body:JSON.stringify({command:cmd})});
     if(!d.ok){toast(`✗ Errore: ${d.error||'sconosciuto'}`);return;}
     if(cmd==='rustdesk'){
-      toast('⏳ Comando inviato — attendo il client...');
+      toast('⏳ Avvio RustDesk sul client — attendo...');
       await pollRDSession(mid);
+    } else if(cmd==='rustdesk_stop'){
+      toast('✓ RustDesk fermato sul client');
+      setTimeout(()=>loadMachines(),2000);
+    } else if(cmd==='update'){
+      toast('⬆ Comando aggiornamento inviato — il client si aggiornerà entro 60s');
+      setTimeout(()=>loadMachines(),15000);
     } else {
       toast('✓ Riavvio inviato — il client si riavvierà entro 30s');
     }
@@ -2114,37 +4213,164 @@ async function pollRDSession(mid){
     await new Promise(r=>setTimeout(r,3000));
     try{
       const s=await api(`/api/machines/${mid}/rd_session`);
-      if(s.ready){showRDModal(s.rd_id,s.rd_pwd,s.expires_at);return;}
+      if(s.ready){
+        showRDModal(s.rd_id, s.rd_pwd, mid);
+        loadMachines();
+        return;
+      }
       if(s.expired){toast('✗ Token scaduto — riprova');return;}
     }catch(e){}
   }
   toast('✗ Timeout — il client non ha risposto entro 60s');
 }
 
-function showRDModal(rdId,rdPwd,expiresAt){
-  const exp=new Date(expiresAt).toLocaleTimeString();
+function showRDModal(rdId,rdPwd,mid=null){
   showModal('⬡ Connessione RustDesk',`
     <div style="text-align:center;padding:10px 0">
       <div style="font-size:11px;color:var(--text2);margin-bottom:6px;letter-spacing:1px;text-transform:uppercase">ID Dispositivo</div>
-      <div style="font-size:30px;font-weight:bold;color:var(--accent);letter-spacing:5px;margin-bottom:20px">${rdId}</div>
-      <div style="font-size:11px;color:var(--text2);margin-bottom:6px;letter-spacing:1px;text-transform:uppercase">Password Temporanea</div>
-      <div style="font-size:30px;font-weight:bold;color:#f0a500;letter-spacing:5px;margin-bottom:6px">${rdPwd}</div>
-      <div style="font-size:11px;color:var(--text3);margin-bottom:20px">⏱ Scade alle ${exp}</div>
-      <div style="display:flex;gap:8px;justify-content:center">
-        <button class="btn btn-p" onclick="window.open('rustdesk://${rdId}','_blank')">⬡ Apri RustDesk</button>
+      <div style="display:flex;align-items:center;justify-content:center;gap:10px;margin-bottom:20px">
+        <span style="font-size:30px;font-weight:bold;color:var(--accent);letter-spacing:5px;font-family:monospace">${rdId}</span>
+        <button class="btn btn-g" style="padding:5px 10px;font-size:12px" onclick="navigator.clipboard.writeText('${rdId}').then(()=>toast('ID copiato!'))">📋 Copia ID</button>
+      </div>
+      <div style="font-size:11px;color:var(--text2);margin-bottom:6px;letter-spacing:1px;text-transform:uppercase">Password</div>
+      <div style="display:flex;align-items:center;justify-content:center;gap:10px;margin-bottom:24px">
+        <span style="font-size:30px;font-weight:bold;color:#f0a500;letter-spacing:5px;font-family:monospace">${rdPwd}</span>
+        <button class="btn btn-g" style="padding:5px 10px;font-size:12px" onclick="navigator.clipboard.writeText('${rdPwd}').then(()=>toast('Password copiata!'))">📋 Copia Password</button>
+      </div>
+      <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap">
+        ${mid ? `<button class="btn" style="background:#c0392b;color:#fff" onclick="sendCommand('${mid}','rustdesk_stop');closeModal()">✕ Disconnetti</button>` : ''}
         <button class="btn btn-g" onclick="closeModal()">Chiudi</button>
       </div>
     </div>`);
+  setTimeout(()=>loadMachines(),1000);
 }
+
 
 function showView(name,el){
   document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));
   document.getElementById(`view-${name}`).classList.add('active');
   if(el){document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));el.classList.add('active')}
   if(name!=='org-detail')document.getElementById('breadcrumb').innerHTML='';
+  if(name==='agent'){ loadAgentVersion(); loadTokens(); }
+  if(name==='settings-mail') loadMailSettings();
+  if(window.innerWidth<=800) closeSidebar();
 }
 
-async function loadDemo(){await api('/api/demo',{method:'POST'});toast('Demo caricata!');refreshAll()}
+async function loadAgentVersion(){
+  try{
+    const d = await fetch('/api/agent/version', {headers:{'X-API-Key': window._apiKey||''}});
+    const j = await d.json();
+    window._deployedVersion = j.version || '';
+    const el = document.getElementById('agent-cur-version');
+    if(el) el.textContent = j.version || '—';
+  }catch(e){}
+  // Controlla se MSI è presente
+  try{
+    const r = await fetch('/download/agent', {method:'HEAD'});
+    const msiEl = document.getElementById('msi-status');
+    if(msiEl) msiEl.textContent = r.ok ? '✓ presente' : '✗ non caricato';
+    if(msiEl) msiEl.style.color = r.ok ? 'var(--accent)' : 'var(--red)';
+  }catch(e){}
+}
+
+async function updateAllAgents(){
+  if(!confirm('Inviare il comando di aggiornamento a tutti i device online?')) return;
+  const machines = Object.values(window._machinesMap||{});
+  // Aggiorna tutti: versione diversa OPPURE versione non rilevata (agent vecchio)
+  const toUpdate = machines.filter(m => !m.agent_version || m.agent_version !== window._deployedVersion);
+  if(!toUpdate.length){toast('Nessun device da aggiornare.');return;}
+  let ok=0, err=0;
+  for(const m of toUpdate){
+    try{
+      const d = await api(`/api/machines/${m.id}/command`,{method:'POST',body:JSON.stringify({command:'update'})});
+      if(d.ok) ok++; else err++;
+    }catch(e){err++;}
+  }
+  toast(`Comando aggiornamento inviato a ${ok} device${err?` (${err} errori)`:''}.`);
+}
+
+// ── Download token management ─────────────────────────────────
+function showCreateToken(){
+  document.getElementById('create-token-form').style.display='block';
+  document.getElementById('tk-label').focus();
+}
+
+async function createToken(){
+  const label = document.getElementById('tk-label').value.trim() || 'Link installer';
+  const days  = parseInt(document.getElementById('tk-days').value)||0;
+  const uses  = parseInt(document.getElementById('tk-uses').value);
+  const d = await api('/api/download-tokens',{method:'POST',body:JSON.stringify({label,days,uses})});
+  if(d.error){toast(d.error,'err');return;}
+  document.getElementById('create-token-form').style.display='none';
+  document.getElementById('tk-label').value='';
+  toast('Link generato!');
+  loadTokens();
+}
+
+async function loadTokens(){
+  const tokens = await api('/api/download-tokens');
+  const el = document.getElementById('token-list');
+  if(!el) return;
+  if(!tokens.length){el.innerHTML='<div style="color:var(--text2);font-size:12px">Nessun link generato.</div>';return;}
+  const origin = window.location.origin;
+  el.innerHTML = tokens.map(t => {
+    const url = `${origin}/download/${t.token}`;
+    const exp = t.expires_at ? `scade ${t.expires_at.split(' ')[0]}` : 'nessuna scadenza';
+    const uses = t.uses_left === -1 ? '∞' : `${t.use_count}/${t.uses_left}`;
+    const expired = t.expires_at && new Date(t.expires_at) < new Date();
+    return `<div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid #1e2733;flex-wrap:wrap">
+      <div style="flex:1;min-width:0">
+        <div style="font-size:12px;font-weight:600;color:${expired?'var(--red)':'var(--text1)'}">${t.label}</div>
+        <div style="font-size:10px;color:var(--text2);font-family:monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${url}</div>
+        <div style="font-size:10px;color:var(--text2);margin-top:2px">${exp} · download: ${uses}</div>
+      </div>
+      <button class="btn btn-sm" onclick="navigator.clipboard.writeText('${url}');toast('Link copiato!')" title="Copia link">📋</button>
+      <button class="btn btn-sm" style="color:var(--red)" onclick="deleteToken('${t.token}')" title="Revoca">✕</button>
+    </div>`;
+  }).join('');
+}
+
+async function deleteToken(token){
+  if(!confirm('Revocare questo link?')) return;
+  await api(`/api/download-tokens/${token}`,{method:'DELETE'});
+  toast('Link revocato');
+  loadTokens();
+}
+
+async function uploadAgentMsi(){
+  const fileInput = document.getElementById('agent-msi-file');
+  if(!fileInput.files.length){toast('Seleziona un file MSI','err');return}
+  const fd = new FormData();
+  fd.append('file', fileInput.files[0]);
+  try{
+    const r = await fetch('/api/agent/msi/upload', {method:'POST', body:fd});
+    const d = await r.json();
+    if(d.error){toast(d.error,'err');return}
+    toast(`MSI caricato (${d.size_mb} MB) — link attivo nella pagina di login.`);
+    fileInput.value='';
+    document.getElementById('msi-status').textContent='✓ presente';
+  }catch(e){toast('Errore upload MSI','err')}
+}
+
+async function uploadAgent(){
+  const version = document.getElementById('agent-new-version').value.trim();
+  const fileInput = document.getElementById('agent-file');
+  if(!version){toast('Inserisci la versione','err');return}
+  if(!fileInput.files.length){toast('Seleziona un file','err');return}
+  const fd = new FormData();
+  fd.append('version', version);
+  fd.append('file', fileInput.files[0]);
+  try{
+    const r = await fetch('/api/agent/upload', {method:'POST', body:fd});
+    const d = await r.json();
+    if(d.error){toast(d.error,'err');return}
+    toast(`Agent v${d.version} pubblicato (${d.size_mb} MB). Clicca "Aggiorna tutti" per forzare subito.`);
+    loadAgentVersion();
+    fileInput.value='';
+    document.getElementById('agent-new-version').value='';
+  }catch(e){toast('Errore upload','err')}
+}
+
 function toast(msg,type='ok'){const el=document.createElement('div');el.className='toast';el.style.borderColor=type==='err'?'rgba(255,71,87,.4)':'rgba(0,212,170,.3)';el.innerHTML=`<span style="color:${type==='err'?'var(--red)':'var(--accent)'}">${type==='err'?'✕':'✓'}</span> ${msg}`;document.getElementById('toasts').appendChild(el);setTimeout(()=>el.remove(),3200)}
 function clock(){document.getElementById('clk').textContent=new Date().toLocaleTimeString('it-IT',{hour:'2-digit',minute:'2-digit'})}
 
@@ -2152,7 +4378,8 @@ function clock(){document.getElementById('clk').textContent=new Date().toLocaleT
 // ── DOCUMENTATION ─────────────────────────────────────────────
 let currentDocOrg = null;
 let currentDocTab = 'apps';
-let docApps=[], docKb=[], docChecklists=[], docWiki=[];
+let docApps=[], docKb=[], docChecklists=[], docWiki=[], docPasswords=[];
+let pwSearch='', pwShowArchived=false;
 
 async function showDocumentation(oid) {
   currentDocOrg = oid;
@@ -2170,6 +4397,7 @@ async function loadAllDocs(oid) {
     api(`/api/orgs/${oid}/docs/checklists`),
     api(`/api/orgs/${oid}/docs/wiki`),
   ]);
+  try { docPasswords = await api(`/api/orgs/${oid}/docs/passwords`); } catch(e){ docPasswords=[]; }
 }
 
 function setDocTab(tab) {
@@ -2195,16 +4423,18 @@ function renderDocView() {
       <button class="tab doc-tab"        id="dtab-kb"      onclick="setDocTab('kb')">📚 Knowledge Base</button>
       <button class="tab doc-tab"        id="dtab-checks"  onclick="setDocTab('checks')">✅ Checklist</button>
       <button class="tab doc-tab"        id="dtab-wiki"    onclick="setDocTab('wiki')">📝 Wiki / Note</button>
+      <button class="tab doc-tab"        id="dtab-passwords" onclick="setDocTab('passwords')">🔑 Password</button>
     </div>`;
   renderDocContent();
 }
 
 function renderDocContent() {
   const el = document.getElementById('doc-content');
-  if (currentDocTab === 'apps')   el.innerHTML = renderApps();
-  if (currentDocTab === 'kb')     el.innerHTML = renderKb();
-  if (currentDocTab === 'checks') el.innerHTML = renderChecklists();
-  if (currentDocTab === 'wiki')   el.innerHTML = renderWiki();
+  if (currentDocTab === 'apps')      el.innerHTML = renderApps();
+  if (currentDocTab === 'kb')        el.innerHTML = renderKb();
+  if (currentDocTab === 'checks')    el.innerHTML = renderChecklists();
+  if (currentDocTab === 'wiki')      el.innerHTML = renderWiki();
+  if (currentDocTab === 'passwords') el.innerHTML = renderPasswords();
 }
 
 // ── APP E SERVIZI ─────────────────────────────────────────────
@@ -2643,13 +4873,280 @@ function openWikiDetail(wid) {
     </div>`);
 }
 
+// ── PASSWORD VAULT ────────────────────────────────────────────
+function renderPasswords() {
+  const q = pwSearch.toLowerCase();
+  let list = docPasswords.filter(p => {
+    if (!pwShowArchived && p.archived) return false;
+    return !q || p.title.toLowerCase().includes(q) || (p.username||'').toLowerCase().includes(q) || (p.url||'').toLowerCase().includes(q);
+  }).slice(0, 10);
+  return `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+      <div style="font-size:13px;font-weight:700">🔑 Password <span style="font-size:10px;color:var(--text3);font-family:monospace">(${list.length})</span></div>
+      <button class="btn btn-p" onclick="openNewPassword()">+ Aggiungi</button>
+    </div>
+    <div style="display:flex;gap:8px;margin-bottom:14px;align-items:center">
+      <input class="search-input" style="flex:1" placeholder="Cerca..." value="${esc(pwSearch)}" oninput="pwSearch=this.value;renderDocContent()">
+      <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text2);cursor:pointer;white-space:nowrap">
+        <input type="checkbox" ${pwShowArchived?'checked':''} onchange="pwShowArchived=this.checked;renderDocContent()"> Mostra archiviati
+      </label>
+    </div>
+    ${!list.length ? `<div class="empty"><div class="empty-icon">🔑</div>Nessuna password trovata</div>` :
+    `<div style="display:flex;flex-direction:column;gap:8px">
+      ${list.map(p=>`
+        <div class="panel" style="padding:0">
+          <div style="padding:12px 16px;display:flex;align-items:center;gap:12px">
+            <div style="width:34px;height:34px;border-radius:8px;background:var(--bg3);display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0">🔑</div>
+            <div style="flex:1;min-width:0">
+              <div style="font-size:13px;font-weight:700">${esc(p.title)}${p.archived?'<span style="font-size:9px;color:var(--text3);margin-left:8px;font-family:monospace">ARCHIVIATO</span>':''}</div>
+              <div style="font-size:11px;color:var(--text3)">${p.description?esc(p.description):''}${p.url?`<span style="font-family:monospace;margin-left:${p.description?'8':'0'}px">${esc(p.url)}</span>`:''}</div>
+            </div>
+            <div style="display:flex;gap:6px">
+              <button class="btn btn-p" style="font-size:10px;padding:4px 10px" onclick="revealPassword('${p.id}')">👁 Mostra</button>
+              <button class="btn btn-g" style="font-size:10px;padding:4px 8px" onclick="openEditPassword('${p.id}')">✏</button>
+              <button class="btn btn-g" style="font-size:10px;padding:4px 8px" onclick="toggleArchivePassword('${p.id}',${p.archived?0:1})">${p.archived?'↺':'⊘'}</button>
+              <button class="btn btn-d" style="font-size:10px;padding:4px 8px" onclick="deletePassword('${p.id}')">✕</button>
+            </div>
+          </div>
+        </div>`).join('')}
+    </div>`}`;
+}
+
+function openNewPassword() {
+  showModal('Aggiungi documento', `
+    <div style="font-size:11px;color:var(--text3);font-family:monospace;text-transform:uppercase;letter-spacing:1px;margin-bottom:14px">Titolo del documento</div>
+    <div class="form-row"><label class="form-label">Descrizione documento</label><input class="form-input" id="fp-desc" placeholder="es. Credenziali accesso router sede"></div>
+    <div class="form-row"><label class="form-label">Nome <span style="color:var(--red)">*</span></label><input class="form-input" id="fp-title" placeholder="Nome del documento"></div>
+    <div class="form-row"><label class="form-label">Nome utente <span style="color:var(--red)">*</span></label><input class="form-input" id="fp-user" placeholder="admin"></div>
+    <div class="form-row">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+        <label class="form-label" style="margin:0">Password <span style="color:var(--red)">*</span></label>
+        <label style="display:flex;align-items:center;gap:5px;font-size:11px;color:var(--text2);cursor:pointer">
+          <input type="checkbox" id="fp-nopass" onchange="document.getElementById('fp-pass-wrap').style.opacity=this.checked?'0.3':'1';document.getElementById('fp-pass').disabled=this.checked"> Nessuna password
+        </label>
+      </div>
+      <div id="fp-pass-wrap" style="display:flex;gap:6px">
+        <input class="form-input" id="fp-pass" type="password" placeholder="••••••••" style="flex:1">
+        <button class="btn btn-g" style="font-size:11px;padding:6px 10px" onclick="togglePwVis('fp-pass',this)">👁</button>
+      </div>
+    </div>
+    <div class="form-row">
+      <label class="form-label">URL</label>
+      <div style="display:flex;align-items:center;background:var(--bg3);border:1px solid var(--border);border-radius:7px;overflow:hidden">
+        <span style="padding:0 10px;font-size:11px;color:var(--text3);font-family:monospace;border-right:1px solid var(--border);white-space:nowrap">https://</span>
+        <input style="flex:1;background:transparent;border:none;padding:8px 10px;font-size:12px;color:var(--text);outline:none" id="fp-url" placeholder="esempio.com">
+      </div>
+    </div>
+    <div class="form-row">
+      <label class="form-label">Note</label>
+      <textarea class="note-area" id="fp-notes" rows="4" maxlength="10000" placeholder="Note aggiuntive..." oninput="document.getElementById('fp-nc').textContent=this.value.length+'/10000'"></textarea>
+      <div style="text-align:right;font-size:10px;color:var(--text3);font-family:monospace;margin-top:3px" id="fp-nc">0/10000</div>
+    </div>
+    <div class="form-actions">
+      <button class="btn btn-g" onclick="closeModal()">Annulla</button>
+      <button class="btn btn-p" onclick="savePassword()">Crea</button>
+    </div>`);
+}
+
+async function savePassword() {
+  const title = document.getElementById('fp-title').value.trim();
+  const username = document.getElementById('fp-user').value.trim();
+  if(!title){toast('Inserisci il nome','err');return}
+  if(!username){toast('Inserisci il nome utente','err');return}
+  const nopass = document.getElementById('fp-nopass').checked;
+  const url = document.getElementById('fp-url').value.trim();
+  await api(`/api/orgs/${currentDocOrg}/docs/passwords`, {method:'POST', body:JSON.stringify({
+    title,
+    description: document.getElementById('fp-desc').value,
+    username,
+    password: nopass ? '' : document.getElementById('fp-pass').value,
+    url: url ? 'https://'+url : '',
+    notes: document.getElementById('fp-notes').value
+  })});
+  closeModal(); toast('Documento salvato!');
+  docPasswords = await api(`/api/orgs/${currentDocOrg}/docs/passwords`); renderDocContent();
+}
+
+function openEditPassword(pid) {
+  const p = docPasswords.find(x=>x.id===pid); if(!p) return;
+  const urlVal = (p.url||'').replace(/^https?:\/\//,'');
+  showModal(`Modifica — ${esc(p.title)}`, `
+    <div style="font-size:11px;color:var(--text3);font-family:monospace;text-transform:uppercase;letter-spacing:1px;margin-bottom:14px">Titolo del documento</div>
+    <div class="form-row"><label class="form-label">Descrizione documento</label><input class="form-input" id="fp-desc" value="${esc(p.description||'')}"></div>
+    <div class="form-row"><label class="form-label">Nome <span style="color:var(--red)">*</span></label><input class="form-input" id="fp-title" value="${esc(p.title)}"></div>
+    <div class="form-row"><label class="form-label">Nome utente <span style="color:var(--red)">*</span></label><input class="form-input" id="fp-user" value="${esc(p.username||'')}"></div>
+    <div class="form-row">
+      <label class="form-label" style="margin-bottom:6px">Nuova Password <span style="font-size:10px;color:var(--text3)">(lascia vuoto per non cambiare)</span></label>
+      <div style="display:flex;gap:6px">
+        <input class="form-input" id="fp-pass" type="password" placeholder="••••••••" style="flex:1">
+        <button class="btn btn-g" style="font-size:11px;padding:6px 10px" onclick="togglePwVis('fp-pass',this)">👁</button>
+      </div>
+    </div>
+    <div class="form-row">
+      <label class="form-label">URL</label>
+      <div style="display:flex;align-items:center;background:var(--bg3);border:1px solid var(--border);border-radius:7px;overflow:hidden">
+        <span style="padding:0 10px;font-size:11px;color:var(--text3);font-family:monospace;border-right:1px solid var(--border);white-space:nowrap">https://</span>
+        <input style="flex:1;background:transparent;border:none;padding:8px 10px;font-size:12px;color:var(--text);outline:none" id="fp-url" value="${esc(urlVal)}">
+      </div>
+    </div>
+    <div class="form-row">
+      <label class="form-label">Note</label>
+      <textarea class="note-area" id="fp-notes" rows="4" maxlength="10000" oninput="document.getElementById('fp-nc').textContent=this.value.length+'/10000'">${esc(p.notes||'')}</textarea>
+      <div style="text-align:right;font-size:10px;color:var(--text3);font-family:monospace;margin-top:3px" id="fp-nc">${(p.notes||'').length}/10000</div>
+    </div>
+    <div class="form-actions">
+      <button class="btn btn-g" onclick="closeModal()">Annulla</button>
+      <button class="btn btn-p" onclick="updatePassword('${pid}')">Salva</button>
+    </div>`);
+}
+
+async function updatePassword(pid) {
+  const urlVal = document.getElementById('fp-url').value.trim();
+  const d = {
+    title: document.getElementById('fp-title').value.trim(),
+    description: document.getElementById('fp-desc').value,
+    username: document.getElementById('fp-user').value,
+    url: urlVal ? 'https://'+urlVal : '',
+    notes: document.getElementById('fp-notes').value
+  };
+  const pw = document.getElementById('fp-pass').value;
+  if(pw) d.password = pw;
+  await api(`/api/orgs/${currentDocOrg}/docs/passwords/${pid}`, {method:'PATCH', body:JSON.stringify(d)});
+  closeModal(); toast('Aggiornato!');
+  docPasswords = await api(`/api/orgs/${currentDocOrg}/docs/passwords`); renderDocContent();
+}
+
+async function toggleArchivePassword(pid, archived) {
+  await api(`/api/orgs/${currentDocOrg}/docs/passwords/${pid}`, {method:'PATCH', body:JSON.stringify({archived})});
+  docPasswords = await api(`/api/orgs/${currentDocOrg}/docs/passwords`); renderDocContent();
+}
+
+async function deletePassword(pid) {
+  if(!confirm('Eliminare questa password?')) return;
+  await api(`/api/orgs/${currentDocOrg}/docs/passwords/${pid}`, {method:'DELETE'});
+  toast('Eliminata'); docPasswords = docPasswords.filter(p=>p.id!==pid); renderDocContent();
+}
+
+function revealPassword(pid) {
+  const p = docPasswords.find(x=>x.id===pid); if(!p) return;
+  const hasTOTP = currentUser?.totp_enabled;
+  showModal('🔑 '+esc(p.title), `
+    <div style="background:var(--bg3);border-radius:8px;padding:14px 16px;margin-bottom:14px;border:1px solid var(--border)">
+      <div style="font-size:10px;color:var(--text3);letter-spacing:1px;text-transform:uppercase;font-family:monospace;margin-bottom:10px">Verifica identità per visualizzare la password</div>
+      ${hasTOTP ? `
+      <div style="margin-bottom:10px">
+        <div style="font-size:11px;color:var(--text2);margin-bottom:6px">Codice autenticatore (2FA)</div>
+        <input class="form-input" id="rv-totp" type="text" inputmode="numeric" maxlength="6" placeholder="000000" style="font-family:monospace;font-size:18px;letter-spacing:4px;text-align:center">
+      </div>` : ''}
+      <div style="display:flex;align-items:center;gap:10px;margin:${hasTOTP?'10px 0 0':''} 0">
+        ${hasTOTP ? `<div style="flex:1;height:1px;background:var(--border)"></div><span style="font-size:10px;color:var(--text3)">oppure</span><div style="flex:1;height:1px;background:var(--border)"></div>` : ''}
+      </div>
+      ${hasTOTP ? '' : '<div style="font-size:11px;color:var(--text2);margin-bottom:8px">Usa la tua passkey per autenticarti</div>'}
+      <button class="btn btn-b" style="width:100%;margin-top:${hasTOTP?'10px':'0'}" onclick="revealViaPasskey('${pid}')">🔑 Usa Passkey</button>
+    </div>
+    <div id="rv-result" style="display:none;margin-bottom:14px">
+      <div style="font-size:10px;color:var(--text3);letter-spacing:1px;text-transform:uppercase;font-family:monospace;margin-bottom:6px">Password</div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <div id="rv-value" style="flex:1;background:var(--bg0);border:1px solid var(--border);border-radius:7px;padding:10px 14px;font-family:monospace;font-size:15px;font-weight:700;letter-spacing:2px;word-break:break-all"></div>
+        <button class="btn btn-g" style="font-size:11px" onclick="navigator.clipboard.writeText(document.getElementById('rv-value').textContent);toast('Copiata negli appunti!')">📋</button>
+      </div>
+    </div>
+    <div style="display:flex;gap:8px" id="rv-actions">
+      ${hasTOTP ? `<button class="btn btn-p" onclick="doRevealTOTP('${pid}')">Conferma 2FA</button>` : ''}
+      <button class="btn btn-g" onclick="closeModal()">Annulla</button>
+    </div>`);
+  if(hasTOTP) {
+    const inp = document.getElementById('rv-totp');
+    if(inp) inp.addEventListener('keydown', e=>{if(e.key==='Enter') doRevealTOTP('${pid}')});
+  }
+}
+
+async function doRevealTOTP(pid) {
+  const code = (document.getElementById('rv-totp')?.value||'').trim();
+  if(code.length!==6){toast('Inserisci il codice a 6 cifre','err');return}
+  const res = await api(`/api/orgs/${currentDocOrg}/docs/passwords/${pid}/reveal`, {method:'POST', body:JSON.stringify({totp_code:code})});
+  if(res.ok) _showRevealResult(res.password, pid);
+}
+
+async function revealViaPasskey(pid) {
+  try {
+    const b = await fetch('/api/auth/passkey/auth/begin', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({})});
+    const opts = await b.json();
+    if(opts.error){toast(opts.error,'err');return}
+    const key = opts._key; delete opts._key;
+    opts.challenge = _b64uToBuf(opts.challenge);
+    if(opts.allowCredentials) opts.allowCredentials = opts.allowCredentials.map(c=>({...c, id:_b64uToBuf(c.id)}));
+    const cred = await navigator.credentials.get({publicKey: opts});
+    const payload = {_key:key, id:cred.id, rawId:_bufToB64u(cred.rawId), type:cred.type, response:{
+      authenticatorData: _bufToB64u(cred.response.authenticatorData),
+      clientDataJSON:    _bufToB64u(cred.response.clientDataJSON),
+      signature:         _bufToB64u(cred.response.signature),
+      userHandle: cred.response.userHandle ? _bufToB64u(cred.response.userHandle) : null
+    }};
+    const fr = await fetch('/api/auth/passkey/auth/finish', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+    const finish = await fr.json();
+    if(!finish.ok){toast('Autenticazione passkey fallita','err');return}
+    const res = await api(`/api/orgs/${currentDocOrg}/docs/passwords/${pid}/reveal`, {method:'POST', body:JSON.stringify({passkey_verified:true})});
+    if(res.ok) _showRevealResult(res.password, pid);
+    else toast(res.error||'Errore reveal','err');
+  } catch(e){
+    if(e.name==='NotAllowedError') toast('Passkey annullata','err');
+    else toast('Errore passkey: '+e.message,'err');
+  }
+}
+
+let _rvRealPw = '';
+function _showRevealResult(pw, pid) {
+  _rvRealPw = pw || '';
+  const p = pid ? docPasswords.find(x=>x.id===pid) : null;
+  const masked = '•'.repeat(Math.min(_rvRealPw.length||8, 24));
+  document.getElementById('modal-title').textContent = '🔑 ' + (p ? (p.title||'Password') : 'Password');
+  document.getElementById('modal-body').innerHTML = `
+    <div style="background:var(--bg3);border-radius:10px;padding:18px;margin-bottom:14px;border:1px solid var(--border)">
+      ${p?.description ? `<div style="font-size:11px;color:var(--text3);margin-bottom:14px">${esc(p.description)}</div>` : ''}
+      ${(p?.username||p?.url) ? `<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px">
+        ${p?.username ? `<div><div style="font-size:9px;color:var(--text3);letter-spacing:1px;text-transform:uppercase;font-family:monospace;margin-bottom:4px">Nome utente</div><div style="font-size:13px;font-family:monospace;font-weight:600">${esc(p.username)}</div></div>` : ''}
+        ${p?.url ? `<div><div style="font-size:9px;color:var(--text3);letter-spacing:1px;text-transform:uppercase;font-family:monospace;margin-bottom:4px">URL</div><div style="font-size:12px;color:var(--accent2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(p.url)}</div></div>` : ''}
+      </div>` : ''}
+      <div style="font-size:9px;color:var(--text3);letter-spacing:1px;text-transform:uppercase;font-family:monospace;margin-bottom:6px">Password</div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <div id="rv-pw-box" data-visible="0" style="flex:1;background:var(--bg0);border:1px solid var(--border);border-radius:8px;padding:12px 16px;font-family:monospace;font-size:16px;font-weight:700;letter-spacing:3px;word-break:break-all">${esc(masked)}</div>
+        <div style="display:flex;flex-direction:column;gap:6px">
+          <button class="btn btn-g" style="font-size:11px;padding:6px 10px" onclick="toggleRevealPw()">👁</button>
+          <button class="btn btn-g" style="font-size:11px;padding:6px 10px" onclick="copyRevealPw()">📋</button>
+        </div>
+      </div>
+    </div>
+    ${p?.notes ? `<div style="font-size:9px;color:var(--text3);letter-spacing:1px;text-transform:uppercase;font-family:monospace;margin-bottom:6px">Note</div><div style="background:var(--bg3);border-radius:8px;padding:12px;font-size:12px;line-height:1.6;white-space:pre-wrap;max-height:120px;overflow-y:auto;margin-bottom:14px">${esc(p.notes)}</div>` : ''}
+    <div style="display:flex;gap:8px"><button class="btn btn-g" onclick="closeModal()">Chiudi</button></div>`;
+  document.getElementById('modal').classList.add('open');
+}
+function toggleRevealPw() {
+  const box = document.getElementById('rv-pw-box');
+  if(!box) return;
+  const visible = box.dataset.visible === '1';
+  box.textContent = visible ? '•'.repeat(Math.min(_rvRealPw.length||8,24)) : _rvRealPw||'(vuota)';
+  box.dataset.visible = visible ? '0' : '1';
+  box.previousElementSibling?.querySelector && null;
+  const btn = box.parentElement?.querySelector('button');
+  if(btn) btn.textContent = visible ? '👁' : '🙈';
+}
+function copyRevealPw() { navigator.clipboard.writeText(_rvRealPw); toast('Password copiata!'); }
+
+function togglePwVis(id, btn) {
+  const inp = document.getElementById(id);
+  inp.type = inp.type==='password'?'text':'password';
+  btn.textContent = inp.type==='password'?'👁':'🙈';
+}
+
 // ── INIT ──────────────────────────────────────────────────────
 (async()=>{
   await initAuth();
   await refreshAll();
   clock();
   setInterval(clock,10000);
-  setInterval(refreshAll,30000);
+  setInterval(refreshAll,60000);
+  setInterval(loadInvites,30000);
 })();
 </script>
 </body>
@@ -2672,6 +5169,10 @@ def _migrate_db():
             ("commands", "token_expires_at","TEXT"),
             ("machines", "rd_temp_pwd",    "TEXT DEFAULT ''"),
             ("machines", "rd_tmp_expires", "TEXT DEFAULT ''"),
+            ("machines", "rd_active",      "INTEGER DEFAULT 0"),
+            ("machines", "rd_active_since","TEXT DEFAULT ''"),
+            ("machines", "rd_expires_at",  "TEXT DEFAULT ''"),
+            ("commands", "duration",       "INTEGER DEFAULT 30"),
         ]:
             try:
                 db.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {typ}")
